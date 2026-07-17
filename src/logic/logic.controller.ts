@@ -3,6 +3,7 @@ import { FeishuService } from '../feishu/feishu.service';
 import { ConfigService } from '../config/config.service';
 import { ConverseService } from '../recruit/converse.service';
 import { MiaohuiService } from '../miaohui/miaohui.service';
+import { ReachService } from '../reach/reach.service';
 
 /** 薪酬/福利/待遇相关问题的确定性识别（预处理，词库可扩充，不用模型避免误判） */
 const SALARY_RE = new RegExp(
@@ -45,7 +46,27 @@ export class LogicController {
     private readonly config: ConfigService,
     private readonly converse: ConverseService,
     private readonly miaohui: MiaohuiService,
+    private readonly reachSvc: ReachService,
   ) {}
+
+  /** 查约面信息：GET /logic/candidate-info?phone=  （画布好友通过后发欢迎语用）
+   *  → 返回 {found, name, position, interviewTime} */
+  @Get('candidate-info')
+  async candidateInfo(@Query('phone') phone: string) {
+    const p = (phone || '').trim();
+    if (!p) return { found: false, msg: '缺少 phone' };
+    return this.reachSvc.getCandidateInfo(p);
+  }
+
+  /** 意图回报：POST /logic/report-intent  body {phone, intent, slots?}
+   *  （画布识别意图后回报 → 触达服务更新状态 + 回填进度表 + 通知HR） */
+  @Post('report-intent')
+  async reportIntent(@Body() body: { phone?: string; intent?: string; slots?: Record<string, any> }) {
+    const phone = (body?.phone || '').trim();
+    const intent = (body?.intent || '').trim();
+    if (!phone || !intent) return { ok: false, msg: '缺少 phone 或 intent' };
+    return this.reachSvc.reportIntent(phone, intent, body?.slots);
+  }
 
   /** 发起触达（加好友）：POST /logic/reach  body {phone, name?, helloMsg?}
    *  供「表格管理服务」在候选人面试信息就绪后调用，用招聘企微加好友。

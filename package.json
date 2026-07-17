@@ -12,9 +12,12 @@
   "dependencies": {
     "@nestjs/common": "^10.3.0",
     "@nestjs/core": "^10.3.0",
+    "@nestjs/mongoose": "^11.0.4",
     "@nestjs/platform-express": "^10.3.0",
     "@nestjs/schedule": "^4.0.0",
     "axios": "^1.6.0",
+    "ioredis": "^5.11.1",
+    "mongoose": "^9.7.4",
     "reflect-metadata": "^0.2.1",
     "rxjs": "^7.8.1"
   },
