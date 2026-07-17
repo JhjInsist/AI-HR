@@ -6,7 +6,6 @@ import { FeishuService } from './feishu.service';
 import { BotService } from '../bot/bot.service';
 import { MiaodongService } from '../miaodong/miaodong.service';
 import { ConverseService } from '../recruit/converse.service';
-import { RecruitService } from '../recruit/recruit.service';
 import { ConfigService } from '../config/config.service';
 
 /**
@@ -24,7 +23,6 @@ export class FeishuController {
     private readonly bot: BotService,
     private readonly miaodong: MiaodongService,
     private readonly converse: ConverseService,
-    private readonly recruit: RecruitService,
     private readonly config: ConfigService,
   ) {}
 
@@ -44,12 +42,6 @@ export class FeishuController {
   async converseTest(@Query('text') text: string, @Query('candidate') candidate?: string) {
     if (!text) return { note: '用 ?text=候选人回复[&candidate=姓名] 测试触达对话' };
     return this.converse.handle(text, candidate);
-  }
-
-  /** 手动触发规则②触达。?live=1 强制真跑(覆盖DRY_RUN)，?name=姓名 只触达某一人。运维/小范围验证用 */
-  @Get('reach')
-  async reach(@Query('live') live?: string, @Query('name') name?: string) {
-    return this.recruit.rule2_reachOut({ live: live === '1', onlyName: name || undefined });
   }
 
   @Post('webhook')
