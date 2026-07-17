@@ -61,11 +61,12 @@ export class LogicController {
   /** 意图回报：POST /logic/report-intent  body {phone, intent, slots?}
    *  （画布识别意图后回报 → 触达服务更新状态 + 回填进度表 + 通知HR） */
   @Post('report-intent')
-  async reportIntent(@Body() body: { phone?: string; intent?: string; slots?: Record<string, any> }) {
-    const phone = (body?.phone || '').trim();
+  async reportIntent(@Body() body: { externalId?: string; contactId?: string; phone?: string; intent?: string; slots?: Record<string, any> }) {
+    // 画布 receive-text-message 回报 contactId；也兼容 externalId/phone
+    const id = (body?.externalId || body?.contactId || body?.phone || '').trim();
     const intent = (body?.intent || '').trim();
-    if (!phone || !intent) return { ok: false, msg: '缺少 phone 或 intent' };
-    return this.reachSvc.reportIntent(phone, intent, body?.slots);
+    if (!id || !intent) return { ok: false, msg: '缺少 externalId/contactId 或 intent' };
+    return this.reachSvc.reportIntent(id, intent, body?.slots);
   }
 
   /** 发起触达（加好友）：POST /logic/reach  body {phone, name?, helloMsg?}

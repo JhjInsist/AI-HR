@@ -17,7 +17,7 @@ export class ConfigService {
     'INTENT_BOT_ID', 'CHAT_BOT_ID', 'MODEL',
     'DRY_RUN', 'INTERVIEW_LINK', 'HELLO_MSG', 'POLL_INTERVAL_SEC',
     'MIAOHUI_GROUP_TOKEN', 'MIAOHUI_CORP_ID', 'MIAOHUI_BOT_USERID', 'FEISHU_BOT_NAME',
-    'HR_NOTIFY_CHAT',
+    'HR_NOTIFY_CHAT', 'HR_EMAIL',
   ];
 
   private read(): Record<string, string> {

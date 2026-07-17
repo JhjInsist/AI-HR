@@ -83,6 +83,85 @@ export class FeishuService {
     );
   }
 
+  /** 应用主日历 ID（应用身份下 primary 返回应用自身日历，用于承载面试日程并邀请 HR） */
+  private async appPrimaryCalendarId(): Promise<string> {
+    const d = await this.req('POST', `/open-apis/calendar/v4/calendars/primary`);
+    const id = d?.calendars?.[0]?.calendar?.calendar_id;
+    if (!id) throw new Error('未取到应用主日历 calendar_id');
+    return id;
+  }
+
+  /** 邮箱 → open_id；失败返回空串，调用方回退为外部邮箱参会人 */
+  private async openIdByEmail(email: string): Promise<string> {
+    try {
+      const d = await this.req(
+        'POST',
+        `/open-apis/contact/v3/users/batch_get_id`,
+        { emails: [email] },
+        { user_id_type: 'open_id' },
+      );
+      return (d?.user_list || []).find((u: any) => u?.user_id)?.user_id || '';
+    } catch (e: any) {
+      this.logger.warn(`邮箱换 open_id 失败 ${email}: ${e?.message}`);
+      return '';
+    }
+  }
+
+  /**
+   * 在应用主日历创建面试日程（带飞书视频会议 vc），并邀请 HR（其个人日历将出现该日程）。
+   * 用应用身份（tenant_access_token），vchat.vc_type=vc 让飞书自动生成会议链接。
+   * @param opts.startTime/opts.endTime 为 Unix 毫秒时间戳
+   * @returns { eventId, meetingUrl }（meetingUrl 可能为空，调用方按空处理）
+   */
+  async createInterviewEvent(opts: {
+    hrEmail: string;
+    summary: string;
+    startTime: number;
+    endTime: number;
+    description?: string;
+  }): Promise<{ eventId: string; meetingUrl: string }> {
+    const calendarId = await this.appPrimaryCalendarId();
+    const cal = encodeURIComponent(calendarId);
+    const created = await this.req('POST', `/open-apis/calendar/v4/calendars/${cal}/events`, {
+      summary: opts.summary,
+      description: opts.description || '',
+      start_time: { timestamp: String(Math.floor(opts.startTime / 1000)), timezone: 'Asia/Shanghai' },
+      end_time: { timestamp: String(Math.floor(opts.endTime / 1000)), timezone: 'Asia/Shanghai' },
+      vchat: { vc_type: 'vc', meeting_settings: { allow_attendees_start: true } },
+      attendee_ability: 'can_see_others',
+      need_notification: true,
+      reminders: [{ minutes: 15 }],
+    });
+    const eventId: string = created?.event?.event_id || '';
+    let meetingUrl: string = created?.event?.vchat?.meeting_url || '';
+
+    // 邀请 HR：优先按 open_id，取不到则用外部邮箱参会人
+    if (opts.hrEmail && eventId) {
+      const openId = await this.openIdByEmail(opts.hrEmail);
+      const attendee = openId
+        ? { type: 'user', user_id: openId }
+        : { type: 'third_party', third_party_email: opts.hrEmail };
+      try {
+        await this.req(
+          'POST',
+          `/open-apis/calendar/v4/calendars/${cal}/events/${eventId}/attendees`,
+          { attendees: [attendee], need_notification: true },
+        );
+      } catch (e: any) {
+        this.logger.warn(`邀请 HR 参会失败 ${opts.hrEmail}: ${e?.message}`);
+      }
+    }
+
+    // 兜底：创建响应未带会议链接时回查一次
+    if (!meetingUrl && eventId) {
+      try {
+        const got = await this.req('GET', `/open-apis/calendar/v4/calendars/${cal}/events/${eventId}`);
+        meetingUrl = got?.event?.vchat?.meeting_url || '';
+      } catch { /* 回查失败不阻断，返回空链接 */ }
+    }
+    return { eventId, meetingUrl };
+  }
+
   /** 下载某记录某附件字段的文件到本地目录，返回文件路径数组 */
   async downloadAttachments(appToken: string, tableId: string, recordId: string, field: string, dir: string): Promise<string[]> {
     // 附件 file_token 在记录字段里；下载走 drive media

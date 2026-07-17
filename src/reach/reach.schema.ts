@@ -68,6 +68,12 @@ export class ReachTask {
   @Prop({ type: Object })
   intentSlots: Record<string, any>;    // 意图槽位
 
+  @Prop()
+  meetingLink: string;                 // 候选人确认约面后创建的飞书视频会议链接
+
+  @Prop()
+  scheduleEventId: string;             // 对应的飞书日历日程 event_id
+
   @Prop({ type: [{ at: Date, event: String, detail: String }], default: [] })
   timeline: TimelineEntry[];           // 全流程留痕
 }

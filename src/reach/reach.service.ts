@@ -24,6 +24,28 @@ function cellText(v: any): string {
   return String(v);
 }
 
+/**
+ * 解析约面时间为 Unix 毫秒时间戳（兼容多格式；解析不了返回 null）。
+ * 支持：Unix 毫秒/秒时间戳、ISO datetime（含时区）、"YYYY-MM-DD HH:mm"（按本地时区）。
+ * 注：表格服务实际传的格式待确认，此处做尽量宽松的兼容。
+ */
+export function parseInterviewTime(raw?: string): number | null {
+  const s = (raw || '').trim();
+  if (!s) return null;
+  // 纯数字：Unix 秒（10 位）或毫秒（13 位）时间戳
+  if (/^\d{10}$/.test(s)) return parseInt(s, 10) * 1000;
+  if (/^\d{13}$/.test(s)) return parseInt(s, 10);
+  // "YYYY-MM-DD HH:mm[:ss]"：转成 ISO（补 T）后按本地时区解析
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (m) {
+    const t = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}`).getTime();
+    return isNaN(t) ? null : t;
+  }
+  // 其余交给 Date 兜底（ISO 带时区等）
+  const t = new Date(s).getTime();
+  return isNaN(t) ? null : t;
+}
+
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
 const INTENT_STATUS: Record<string, ReachStatus> = {
   ACCEPT: ReachStatus.INTENT_ACCEPT, TIME: ReachStatus.INTENT_ACCEPT, 确认: ReachStatus.INTENT_ACCEPT,
@@ -188,10 +210,12 @@ export class ReachService {
 
   // ───────────────────────── ④ 画布 plugin：意图回报 ─────────────────────────
   /** 画布识别意图后回报：更新 status=INTENT_xxx + 回填进度表 + 通知HR。 */
-  async reportIntent(phone: string, intent: string, slots?: Record<string, any>) {
-    const p = (phone || '').trim();
-    const task = await this.taskModel.findOne({ phone: p }).sort({ createdAt: -1 }).exec();
-    if (!task) return { ok: false, msg: `未找到 ${p} 的触达任务` };
+  async reportIntent(externalId: string, intent: string, slots?: Record<string, any>) {
+    const id = (externalId || '').trim();
+    // 画布(receive-text-message)回报的是 contactId；触达任务好友通过时存了 externalUserId/wxid。
+    // 灵活匹配这三个字段（联调用真实回调样例确认 contactId 具体等于 externalUserId 还是 wxid）。
+    const task = await this.taskModel.findOne({ $or: [{ externalUserId: id }, { wxid: id }, { phone: id }] }).sort({ createdAt: -1 }).exec();
+    if (!task) return { ok: false, msg: `未找到 ${id} 的触达任务` };
 
     const status = INTENT_STATUS[(intent || '').toUpperCase()] || INTENT_STATUS[intent] || ReachStatus.REPLIED;
     task.intent = intent;
@@ -202,18 +226,64 @@ export class ReachService {
     await task.save();
     await this.appendTimeline(task.taskId, `INTENT_${intent}`, slots ? JSON.stringify(slots) : undefined);
 
+    // 确认约面：在 HR 飞书日历建带视频会议的面试日程，拿会议链接（失败不阻断）
+    let meetingLink = task.meetingLink || '';
+    if (status === ReachStatus.INTENT_ACCEPT && !meetingLink) {
+      meetingLink = await this.scheduleInterview(task, slots);
+    }
+
     // 同步HR：确认/改约/拒绝/转人工才通知；提问不打扰
     const slotTime = slots?.time || slots?.interviewTime || '';
     const notifyMap: Record<string, string> = {
-      [ReachStatus.INTENT_ACCEPT]: `✅【候选人已确认】${task.name || p} 确认约面${slotTime ? `：${slotTime}` : ''}。`,
-      [ReachStatus.INTENT_RESCHEDULE]: `🔄【候选人要改约】${task.name || p} 希望调整面试时间${slotTime ? `：${slotTime}` : ''}，请HR协调。`,
-      [ReachStatus.INTENT_REJECT]: `🚫【候选人拒绝】${task.name || p} 婉拒本次面试，流程关闭。`,
-      [ReachStatus.HANDOVER]: `👤【转人工】${task.name || p} 需真人跟进，请HR接手。`,
+      [ReachStatus.INTENT_ACCEPT]: `✅【候选人已确认】${task.name || id} 确认约面${slotTime ? `：${slotTime}` : ''}。${meetingLink ? `\n面试会议链接：${meetingLink}` : ''}`,
+      [ReachStatus.INTENT_RESCHEDULE]: `🔄【候选人要改约】${task.name || id} 希望调整面试时间${slotTime ? `：${slotTime}` : ''}，请HR协调。`,
+      [ReachStatus.INTENT_REJECT]: `🚫【候选人拒绝】${task.name || id} 婉拒本次面试，流程关闭。`,
+      [ReachStatus.HANDOVER]: `👤【转人工】${task.name || id} 需真人跟进，请HR接手。`,
     };
     const msg = notifyMap[status];
     if (msg) await this.notifyHr(msg);
     await this.backfillProgress(task, `候选人意图=${intent}${slotTime ? `(${slotTime})` : ''}`);
-    return { ok: true, taskId: task.taskId, status: task.status };
+    return { ok: true, taskId: task.taskId, status: task.status, meetingLink };
+  }
+
+  /**
+   * 候选人确认约面后，在 HR 飞书日历创建带视频会议的面试日程。
+   * 取值优先级：slots.time/interviewTime > task.interviewTime。解析不了则跳过建日程（记 warning）。
+   * 建日程失败/无 HR_EMAIL 均不阻断，返回空链接。成功则把 meetingLink/eventId 存入 task。
+   */
+  private async scheduleInterview(task: ReachTaskDocument, slots?: Record<string, any>): Promise<string> {
+    const raw = (slots?.time || slots?.interviewTime || task.interviewTime || '').toString();
+    const start = parseInterviewTime(raw);
+    if (start == null) {
+      this.logger.warn(`[约面日程] 无法解析约面时间「${raw}」，跳过建日程 task=${task.taskId}`);
+      await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', `约面时间无法解析：${raw}`);
+      return '';
+    }
+    const hrEmail = this.config.get('HR_EMAIL');
+    if (!hrEmail) {
+      this.logger.warn(`[约面日程] 未配置 HR_EMAIL，跳过建日程 task=${task.taskId}`);
+      await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', '未配置 HR_EMAIL');
+      return '';
+    }
+    const end = start + 60 * 60 * 1000; // 结束=开始+1小时
+    try {
+      const { eventId, meetingUrl } = await this.feishu.createInterviewEvent({
+        hrEmail,
+        summary: `面试-${task.name || task.phone}-${task.position || '岗位待定'}`,
+        startTime: start,
+        endTime: end,
+        description: `候选人：${task.name || ''}（${task.phone}）\n岗位：${task.position || ''}`,
+      });
+      task.meetingLink = meetingUrl || '';
+      task.scheduleEventId = eventId || '';
+      await task.save();
+      await this.appendTimeline(task.taskId, 'SCHEDULE_OK', `建面试日程 event=${eventId} 会议链接=${meetingUrl || '(空)'}`);
+      return meetingUrl || '';
+    } catch (e: any) {
+      this.logger.error(`[约面日程] 建日程失败 task=${task.taskId}: ${e?.message}`);
+      await this.appendTimeline(task.taskId, 'SCHEDULE_FAILED', e?.message);
+      return '';
+    }
   }
 
   // ───────────────────────── 公共：定位/通知/回填 ─────────────────────────
