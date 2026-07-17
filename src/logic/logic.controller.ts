@@ -1,7 +1,8 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Get, Post, Body, Query } from '@nestjs/common';
 import { FeishuService } from '../feishu/feishu.service';
 import { ConfigService } from '../config/config.service';
 import { ConverseService } from '../recruit/converse.service';
+import { MiaohuiService } from '../miaohui/miaohui.service';
 
 /** 薪酬/福利/待遇相关问题的确定性识别（预处理，词库可扩充，不用模型避免误判） */
 const SALARY_RE = new RegExp(
@@ -43,7 +44,20 @@ export class LogicController {
     private readonly feishu: FeishuService,
     private readonly config: ConfigService,
     private readonly converse: ConverseService,
+    private readonly miaohui: MiaohuiService,
   ) {}
+
+  /** 发起触达（加好友）：POST /logic/reach  body {phone, name?, helloMsg?}
+   *  供「表格管理服务」在候选人面试信息就绪后调用，用招聘企微加好友。
+   *  纯执行加好友，不涉及表格逻辑。返回 {ok, code}。 */
+  @Post('reach')
+  async reach(@Body() body: { phone?: string; name?: string; helloMsg?: string }) {
+    const phone = (body?.phone || '').trim();
+    if (!/^1[3-9]\d{9}$/.test(phone)) return { ok: false, code: -1, msg: '缺少或非法手机号 phone' };
+    const hello = body?.helloMsg || this.config.get('HELLO_MSG', '你好，我是句子互动招聘助理，看到你投递的岗位，想跟你约一次面试~');
+    const res = await this.miaohui.addFriendByPhone(phone, hello);
+    return { ok: res.ok, code: res.code, name: body?.name || '', phone };
+  }
 
   /** 薪资等问题通知HR：GET /logic/notify-hr?question=候选人问题[&candidate=姓名]
    *  用飞书应用把问询同步到 HR（HR_NOTIFY_CHAT 配置的飞书会话），返回给候选人的过渡话术 */
