@@ -202,7 +202,13 @@ export class ReachService {
   async handleCallback(body: any) {
     // ⚠️ 秒回小组级回调字段都在 data 下：body = { code, data: {...} }（见 known-everything 回调文档）
     const d = body?.data || body;
-    this.logger.log(`[mh回调] 收到回调 keys=${Object.keys(d || {}).join(',')} isSelf=${d?.isSelf} contactId=${d?.contactId || ''} wxid=${d?.wxid || ''} sentStatus=${d?.sentStatus}`);
+    // 【观测】全量打印秒回推送原文，用于确认不同推送的真实结构（token 脱敏）
+    try {
+      const safe = JSON.parse(JSON.stringify(body));
+      if (safe?.data?.token) safe.data.token = '***';
+      if (safe?.token) safe.token = '***';
+      this.logger.log(`[mh回调·原文] ${JSON.stringify(safe)}`);
+    } catch { /* ignore */ }
     // 回调来源校验：回调 body.data.token 是小组级 token，须与配置的 MIAOHUI_GROUP_TOKEN 一致
     const groupToken = this.config.get('MIAOHUI_GROUP_TOKEN');
     if (groupToken && d?.token && d.token !== groupToken) {
@@ -210,6 +216,13 @@ export class ReachService {
       return;
     }
     const id = d?.messageId || d?.requestId || body?.eventId;
+    // 【观测】识别推送类型（与下方分发判据一致），便于确认分类是否正确
+    let type = 'UNKNOWN(未识别)';
+    if (d?.isSelf !== undefined && d?.contactId) type = 'MESSAGE(收到消息)';
+    else if (d?.sentStatus !== undefined) type = 'SENT_RESULT(发送结果)';
+    else if (d?.createTimestamp !== undefined && d?.code !== undefined) type = 'FRIEND_SEND(加好友结果)';
+    else if (d?.wxid && d?.phoneNum) type = 'FRIEND_CONFIRM(好友通过)';
+    this.logger.log(`[mh回调·识别] 类型=${type} isSelf=${d?.isSelf} contactType=${d?.contactType} msgType=${d?.messageType ?? d?.type} contactId=${d?.contactId || ''} wxid=${d?.wxid || ''} chatId=${d?.chatId || ''} msgId=${d?.messageId || ''} 文本=${JSON.stringify(this.extractMsgText(d)).slice(0, 60)}`);
     try {
       // 接收消息回调（候选人回复，data.isSelf + data.contactId）→ 服务主导对话（已弃用秒懂画布）
       if (d?.isSelf !== undefined && d?.contactId) return await this.onMessage(d, id);
@@ -342,17 +355,29 @@ export class ReachService {
     const key = `mh:confirm:${id || body.wxid || body.phoneNum}`;
     if (!(await this.lock(key))) return;
     const extraInfo = (body?.extraInfo || '').trim();
-    const task = extraInfo ? await this.taskModel.findOne({ taskId: extraInfo }).exec() : null;
+    const phone = (body?.phoneNum || '').toString().trim();
+    // 先按 extraInfo(本系统 taskId) 精确命中；命中不到再按手机号回退查本系统「加好友中」任务。
+    // 候选人可能点的是更早那次加好友邀请（extraInfo 是旧 taskId，旧任务已被 /reach 幂等清理），
+    // 此时 extraInfo 对不上但手机号能对上。createTask 对同手机号 deleteMany，库内同 phone 最多一条任务，
+    // 回退不会混淆；库里查不到该手机号任务才算「非本系统」（限制仍成立）。
+    let task = extraInfo ? await this.taskModel.findOne({ taskId: extraInfo }).exec() : null;
+    if (!task && phone) {
+      task = await this.taskModel
+        .findOne({ phone, status: { $in: [ReachStatus.ADDING, ReachStatus.PENDING, ReachStatus.CONFIRMED] } })
+        .sort({ createdAt: -1 })
+        .exec();
+      if (task) this.logger.log(`[friend/confirm] extraInfo=${extraInfo || '无'} 未命中，按手机号回退命中本系统任务 ${task.taskId}`);
+    }
     if (!task) {
-      this.logger.log(`[friend/confirm] 非本系统触达（extraInfo=${extraInfo || '无'}），不触发约面 phone=${body.phoneNum}`);
+      this.logger.log(`[friend/confirm] 非本系统触达（extraInfo=${extraInfo || '无'} phone=${phone} 库无对应任务），不触发约面`);
       return;
     }
     task.status = ReachStatus.CONFIRMED;
     task.wxid = body.wxid || task.wxid;
     task.externalUserId = body.externalUserId || body.externalUserid || task.externalUserId;
     await task.save();
-    await this.appendTimeline(task.taskId, 'CONFIRMED', `好友通过 wxid=${task.wxid}`);
-    this.logger.log(`[friend/confirm] ${task.name || task.phone} 好友已通过`);
+    await this.appendTimeline(task.taskId, 'CONFIRMED', `好友通过 wxid=${task.wxid} extId=${task.externalUserId || '无'}`);
+    this.logger.log(`[friend/confirm] ${task.name || task.phone} 好友已通过 extId=${task.externalUserId || '无'}`);
   }
 
   /** 加好友结果：code=1 失败 → ADD_FAILED + 通知HR */
