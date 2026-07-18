@@ -98,7 +98,7 @@ var FIELDS=["AIHR_APP_TOKEN","AIHR_TABLE_ID","PROG_APP_TOKEN","PROG_TABLE_ID","I
 function el(id){return document.getElementById(id)}
 function msg(t,cls){var m=el("msg");m.textContent=t;m.className=cls||""}
 function load(){
-  fetch("config").then(function(r){return r.json()}).then(function(d){
+  fetch("/admin/config").then(function(r){return r.json()}).then(function(d){
     var sel=el("MODEL");sel.innerHTML="";
     d.models.forEach(function(g){
       var og=document.createElement("optgroup");og.label=g.provider;
@@ -111,7 +111,7 @@ function load(){
 function collect(){var o={};FIELDS.forEach(function(k){var e=el(k);if(e)o[k]=e.value});return o}
 function save(){
   msg("保存中...");
-  fetch("config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(collect())})
+  fetch("/admin/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(collect())})
     .then(function(r){return r.json()}).then(function(d){msg(d.ok?"✓ 已保存并生效":"保存失败",d.ok?"ok":"err")})
     .catch(function(){msg("保存失败","err")});
 }
@@ -119,7 +119,7 @@ function applyModel(){
   var m=el("MODEL").value;
   if(!confirm("将两个 bot 都切换到 "+m+" 并重建秒懂画布，确定？"))return;
   msg("切换中，请稍候（重建画布约需几秒）...");
-  fetch("model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:m})})
+  fetch("/admin/model",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:m})})
     .then(function(r){return r.json()}).then(function(d){msg(d.ok?("✓ "+d.msg):("✕ "+d.msg),d.ok?"ok":"err")})
     .catch(function(){msg("切换失败","err")});
 }
@@ -137,17 +137,17 @@ function renderHr(list){
     wrap.appendChild(span);wrap.appendChild(btn);row.appendChild(wrap);box.appendChild(row);
   });
 }
-function loadHr(){fetch("hr").then(function(r){return r.json()}).then(renderHr).catch(function(){})}
+function loadHr(){fetch("/admin/hr").then(function(r){return r.json()}).then(renderHr).catch(function(){})}
 function addHr(){
   var name=el("hrName").value.trim();if(!name){msg("请先填面试官姓名","err");return}
-  fetch("hr",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,email:el("hrEmail_new").value.trim(),note:el("hrNote").value.trim()})})
+  fetch("/admin/hr",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,email:el("hrEmail_new").value.trim(),note:el("hrNote").value.trim()})})
     .then(function(r){return r.json()}).then(function(d){
       if(d.ok){el("hrName").value="";el("hrEmail_new").value="";el("hrNote").value="";renderHr(d.list);msg("✓ 已保存 "+name,"ok")}
       else msg(d.msg||"保存失败","err")});
 }
 function delHr(name){
   if(!confirm("删除面试官「"+name+"」？"))return;
-  fetch("hr/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name})})
+  fetch("/admin/hr/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name})})
     .then(function(r){return r.json()}).then(function(d){renderHr(d.list);msg("✓ 已删除 "+name,"ok")}).catch(function(){msg("删除失败","err")});
 }
 load();loadHr();
