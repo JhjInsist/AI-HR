@@ -76,6 +76,16 @@ export function buildInviteMessage(name?: string, position?: string, interviewTi
   return tpl.replace(/\{name\}/g, nm).replace(/\{position\}/g, pos).replace(/\{time\}/g, timeText);
 }
 
+/** 开场白（好友通过后发，探面试意向，不带具体时间）。占位符 {name} {position} */
+export function buildOpening(name?: string, position?: string, template?: string): string {
+  const pos = position || '相关';
+  const nm = name || '您';
+  const tpl = template && template.trim()
+    ? template
+    : '{name}您好~ 我是句子互动招聘助理😊 看到您投递的【{position}】岗位简历，想跟您约一次面试，请问您近期方便吗？';
+  return tpl.replace(/\{name\}/g, nm).replace(/\{position\}/g, pos);
+}
+
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
 const INTENT_STATUS: Record<string, ReachStatus> = {
   ACCEPT: ReachStatus.INTENT_ACCEPT, TIME: ReachStatus.INTENT_ACCEPT, 确认: ReachStatus.INTENT_ACCEPT,
@@ -222,7 +232,7 @@ export class ReachService {
 
   /** 好友通过后发带时间欢迎语（用 task.chatId 经秒回 /message/send 发） */
   private async sendWelcome(task: ReachTaskDocument) {
-    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'));
+    const welcome = buildOpening(task.name, task.position, this.config.get('OPENING_TEMPLATE'));
     if (task.chatId) {
       const r = await this.miaohui.sendText(task.chatId, welcome);
       this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code}`);
@@ -245,7 +255,8 @@ export class ReachService {
         status = ReachStatus.INTENT_ACCEPT;
         if (!meetingLink) meetingLink = await this.scheduleInterview(task, given ? { time: given } : {});
         const timeText = given || formatInterviewTimeText(task.interviewTime);
-        reply = `好的，面试就约在【${timeText}】啦~ 线上视频形式${meetingLink ? `，会议链接：${meetingLink}` : '，会议链接稍后发您'}。到时见~`;
+        reply = buildInviteMessage(task.name, task.position, given || task.interviewTime, this.config.get('WELCOME_TEMPLATE'));
+        if (meetingLink) reply += `\n会议链接：${meetingLink}`;
         note = `候选人确认面试时间【${timeText}】`;
         break;
       }
