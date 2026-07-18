@@ -64,7 +64,8 @@ button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)
     <h2>📨 触达 <span class="tag">加好友 + 话术 + 开关</span></h2>
     <div class="row"><label><b>运行模式</b>误操防线</label><div><select id="DRY_RUN"><option value="true">演练（不真发，只记日志）</option><option value="false">真跑（真加好友触达）</option></select></div></div>
     <div class="row"><label><b>面试链接</b>约上时间后发</label><input id="INTERVIEW_LINK" placeholder="https://..."/></div>
-    <div class="row"><label><b>加好友欢迎语</b>建联首句</label><textarea id="HELLO_MSG"></textarea></div>
+    <div class="row"><label><b>打招呼语</b>加好友申请附言(第一句)</label><textarea id="HELLO_MSG"></textarea></div>
+    <div class="row"><label><b>约面欢迎语</b>好友通过后发；占位符 {name} {position} {time}</label><textarea id="WELCOME_TEMPLATE" placeholder="{name}您好~ 我是句子互动招聘助理😊 您应聘的【{position}】岗位，一面初步约在 {time}。方便的话回复「可以」确认；如需调整，回复您方便的时间就好~"></textarea></div>
     <div class="row"><label><b>轮询间隔(秒)</b>改后需重启生效</label><input id="POLL_INTERVAL_SEC" placeholder="120"/></div>
   </div>
 
@@ -101,7 +102,7 @@ button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)
 <div class="bar"><div class="inner"><button type="button" onclick="save()">保存配置</button><span id="msg"></span></div></div>
 
 <script>
-var FIELDS=["AIHR_APP_TOKEN","AIHR_TABLE_ID","PROG_APP_TOKEN","PROG_TABLE_ID","INTENT_BOT_ID","CHAT_BOT_ID","MODEL","DRY_RUN","INTERVIEW_LINK","HELLO_MSG","POLL_INTERVAL_SEC","MIAOHUI_GROUP_TOKEN","MIAOHUI_CORP_ID","MIAOHUI_BOT_USERID","FEISHU_BOT_NAME","HR_EMAIL","HR_NOTIFY_CHAT","KNOWLEDGE_BASE"];
+var FIELDS=["AIHR_APP_TOKEN","AIHR_TABLE_ID","PROG_APP_TOKEN","PROG_TABLE_ID","INTENT_BOT_ID","CHAT_BOT_ID","MODEL","DRY_RUN","INTERVIEW_LINK","HELLO_MSG","POLL_INTERVAL_SEC","MIAOHUI_GROUP_TOKEN","MIAOHUI_CORP_ID","MIAOHUI_BOT_USERID","FEISHU_BOT_NAME","HR_EMAIL","HR_NOTIFY_CHAT","KNOWLEDGE_BASE","WELCOME_TEMPLATE"];
 function el(id){return document.getElementById(id)}
 function msg(t,cls){var m=el("msg");m.textContent=t;m.className=cls||""}
 function load(){

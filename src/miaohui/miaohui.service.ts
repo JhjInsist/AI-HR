@@ -53,7 +53,7 @@ export class MiaohuiService {
     try {
       const { data } = await axios.post(
         `${this.base}/message/send`,
-        { token, chatId, messageType: 0, text },
+        { token, chatId, messageType: 0, payload: { text } },
         { headers: { 'Content-Type': 'application/json' }, timeout: 30000 },
       );
       return { ok: data?.code === 0, code: data?.code, raw: data };

@@ -66,11 +66,14 @@ export function formatInterviewTimeText(raw?: string): string {
  * 招聘纯企微场景 wecom-contact-bind 画布触发不可用，故把邀约直接并进加好友申请语，
  * 好友一通过候选人即看到带时间的完整邀约；候选人回复走画布 receive 意图链。
  */
-export function buildInviteMessage(name?: string, position?: string, interviewTimeRaw?: string): string {
+export function buildInviteMessage(name?: string, position?: string, interviewTimeRaw?: string, template?: string): string {
   const timeText = formatInterviewTimeText(interviewTimeRaw);
   const pos = position || '相关';
-  const who = name ? `${name}您好` : '您好';
-  return `${who}~ 我是句子互动招聘助理😊 您应聘的【${pos}】岗位，一面初步约在 ${timeText}。方便的话回复「可以」确认；如需调整，回复您方便的时间就好~`;
+  const nm = name || '您';
+  const tpl = template && template.trim()
+    ? template
+    : '{name}您好~ 我是句子互动招聘助理😊 您应聘的【{position}】岗位，一面初步约在 {time}。方便的话回复「可以」确认；如需调整，回复您方便的时间就好~';
+  return tpl.replace(/\{name\}/g, nm).replace(/\{position\}/g, pos).replace(/\{time\}/g, timeText);
 }
 
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
@@ -219,7 +222,7 @@ export class ReachService {
 
   /** 好友通过后发带时间欢迎语（用 task.chatId 经秒回 /message/send 发） */
   private async sendWelcome(task: ReachTaskDocument) {
-    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime);
+    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'));
     if (task.chatId) {
       const r = await this.miaohui.sendText(task.chatId, welcome);
       this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code}`);

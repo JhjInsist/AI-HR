@@ -25,7 +25,7 @@ export class ConfigService implements OnModuleInit {
     'HR_NOTIFY_CHAT', 'HR_EMAIL',
     'LLM_PROVIDER', 'LLM_MODEL', 'ANTHROPIC_API_KEY', 'LLM_PROXY_ENDPOINT', 'HTTP_PROXY_URI',
     'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION',
-    'KNOWLEDGE_BASE',
+    'KNOWLEDGE_BASE', 'WELCOME_TEMPLATE',
   ];
 
   constructor(
