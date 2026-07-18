@@ -244,7 +244,8 @@ export class ReachService {
       case 'TIME': {
         status = ReachStatus.INTENT_ACCEPT;
         if (!meetingLink) meetingLink = await this.scheduleInterview(task, given ? { time: given } : {});
-        const timeText = given || formatInterviewTimeText(task.interviewTime);
+        // 话术时间与实际建的日程保持一致：优先 HR 结构化「一面时间」，无则用候选人口语时间
+        const timeText = task.interviewTime ? formatInterviewTimeText(task.interviewTime) : (given || '（时间待定）');
         reply = `好的，面试就约在【${timeText}】啦~ 线上视频形式${meetingLink ? `，会议链接：${meetingLink}` : '，会议链接稍后发您'}。到时见~`;
         note = `候选人确认面试时间【${timeText}】`;
         break;
@@ -402,15 +403,23 @@ export class ReachService {
 
   /**
    * 候选人确认约面后，在 HR 飞书日历创建带视频会议的面试日程。
-   * 取值优先级：slots.time/interviewTime > task.interviewTime。解析不了则跳过建日程（记 warning）。
-   * 建日程失败/无 HR_EMAIL 均不阻断，返回空链接。成功则把 meetingLink/eventId 存入 task。
+   *
+   * 约面时间取值：**优先「能解析成功」的时间**。
+   * - slots.time/interviewTime 多来自候选人口头回复经 extractTime 抽取，往往是中文口语
+   *   （如「明天下午3点」），parseInterviewTime 解析不了；
+   * - task.interviewTime 是 HR 在进度表填的结构化「一面时间」（时间戳/ISO），权威可解析。
+   * 故先试 slot（画布/结构化场景可用），解析不了再回退 task.interviewTime，
+   * 避免候选人一说口语时间就把可解析的结构化时间挤掉、导致日程建不出来（历史 bug）。
+   * 两者都解析不了才 SCHEDULE_SKIP。建日程失败/无 HR 均不阻断，返回空链接。
    */
   private async scheduleInterview(task: ReachTaskDocument, slots?: Record<string, any>): Promise<string> {
-    const raw = (slots?.time || slots?.interviewTime || task.interviewTime || '').toString();
-    const start = parseInterviewTime(raw);
+    const slotRaw = (slots?.time || slots?.interviewTime || '').toString();
+    const taskRaw = (task.interviewTime || '').toString();
+    // 先用 slot（若能解析），否则回退 HR 结构化时间
+    const start = parseInterviewTime(slotRaw) ?? parseInterviewTime(taskRaw);
     if (start == null) {
-      this.logger.warn(`[约面日程] 无法解析约面时间「${raw}」，跳过建日程 task=${task.taskId}`);
-      await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', `约面时间无法解析：${raw}`);
+      this.logger.warn(`[约面日程] 约面时间无法解析（slot=「${slotRaw}」/进度表=「${taskRaw}」），跳过建日程 task=${task.taskId}`);
+      await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', `约面时间无法解析：slot=${slotRaw || '(空)'} 进度表=${taskRaw || '(空)'}`);
       return '';
     }
     // 选面试官 HR：按面试官姓名查名录拿邮箱/openId，回退全局 HR_EMAIL
@@ -422,7 +431,7 @@ export class ReachService {
     }
     const end = start + 60 * 60 * 1000; // 结束=开始+1小时
     try {
-      const { eventId, meetingUrl } = await this.feishu.createInterviewEvent({
+      const { eventId, meetingUrl, hrInvited, hrInviteWarn } = await this.feishu.createInterviewEvent({
         hrEmail,
         hrOpenId,
         summary: `面试-${task.name || task.phone}-${task.position || '岗位待定'}`,
@@ -433,11 +442,23 @@ export class ReachService {
       task.meetingLink = meetingUrl || '';
       task.scheduleEventId = eventId || '';
       await task.save();
-      await this.appendTimeline(task.taskId, 'SCHEDULE_OK', `建面试日程 event=${eventId} 会议链接=${meetingUrl || '(空)'}`);
+      const hrTag = hrInvited ? `HR已进日历(可管理)` : `HR未进日历`;
+      await this.appendTimeline(
+        task.taskId,
+        'SCHEDULE_OK',
+        `建面试日程 event=${eventId} 会议链接=${meetingUrl || '(空)'} 面试官=${interviewer || '(未知)'} ${hrTag}`,
+      );
+      // HR 未以飞书用户身份进日历（换不到 open_id / 邀请失败）→ 单独记一条告警，便于定位权限/名录问题
+      if (hrInviteWarn) {
+        this.logger.warn(`[约面日程] task=${task.taskId} ${hrInviteWarn}`);
+        await this.appendTimeline(task.taskId, 'SCHEDULE_HR_WARN', hrInviteWarn);
+      }
       return meetingUrl || '';
     } catch (e: any) {
-      this.logger.error(`[约面日程] 建日程失败 task=${task.taskId}: ${e?.message}`);
-      await this.appendTimeline(task.taskId, 'SCHEDULE_FAILED', e?.message);
+      // 透传飞书返回码（403 权限 / 数据错误一眼可辨）：req 抛的 Error 带 code+msg；HTTP 层错误取 response.data
+      const detail = e?.response?.data ? JSON.stringify(e.response.data) : e?.message;
+      this.logger.error(`[约面日程] 建日程失败 task=${task.taskId}: ${detail}`);
+      await this.appendTimeline(task.taskId, 'SCHEDULE_FAILED', detail);
       return '';
     }
   }

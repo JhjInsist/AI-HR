@@ -108,10 +108,20 @@ export class FeishuService {
   }
 
   /**
-   * 在应用主日历创建面试日程（带飞书视频会议 vc），并邀请 HR（其个人日历将出现该日程）。
+   * 在应用主日历创建面试日程（带飞书视频会议 vc），并把 HR 以「飞书内部用户」身份邀请为参会人。
    * 用应用身份（tenant_access_token），vchat.vc_type=vc 让飞书自动生成会议链接。
+   *
+   * 「日程进 HR 日历 + HR 有管理权」的实现（飞书公有云机制）：
+   * - tenant_access_token 建的日程本体归属「应用日历」，写不进 HR 主日历本体；
+   * - 但用 open_id 邀请飞书内部用户为参会人 → 日程会显示在该 HR 的飞书日历里；
+   * - 配合 attendee_ability=can_modify_event → HR 获得改期/增删参会人等完整管理权。
+   * - 若只拿到邮箱且换不到 open_id（如非内部账号 / contact 权限未开），回退 third_party_email
+   *   只能发邮件通知，**不会进 HR 飞书日历**，此时通过 hrInviteWarn 明确回传告警。
+   *
    * @param opts.startTime/opts.endTime 为 Unix 毫秒时间戳
-   * @returns { eventId, meetingUrl }（meetingUrl 可能为空，调用方按空处理）
+   * @returns { eventId, meetingUrl, hrInvited, hrInviteWarn }
+   *   hrInvited=true 表示已以飞书用户身份邀请成功（会进 HR 日历且有管理权）；
+   *   hrInviteWarn 非空表示 HR 邀请有问题（未进日历 / API 失败），供上层记录 timeline。
    */
   async createInterviewEvent(opts: {
     hrEmail?: string;
@@ -120,7 +130,7 @@ export class FeishuService {
     startTime: number;
     endTime: number;
     description?: string;
-  }): Promise<{ eventId: string; meetingUrl: string }> {
+  }): Promise<{ eventId: string; meetingUrl: string; hrInvited: boolean; hrInviteWarn: string }> {
     const calendarId = await this.appPrimaryCalendarId();
     const cal = encodeURIComponent(calendarId);
     const created = await this.req('POST', `/open-apis/calendar/v4/calendars/${cal}/events`, {
@@ -129,28 +139,41 @@ export class FeishuService {
       start_time: { timestamp: String(Math.floor(opts.startTime / 1000)), timezone: 'Asia/Shanghai' },
       end_time: { timestamp: String(Math.floor(opts.endTime / 1000)), timezone: 'Asia/Shanghai' },
       vchat: { vc_type: 'vc', meeting_settings: { allow_attendees_start: true } },
-      attendee_ability: 'can_see_others',
+      // 给参会人（HR）完整编辑权：改期、增删参会人、管理会议
+      attendee_ability: 'can_modify_event',
       need_notification: true,
       reminders: [{ minutes: 15 }],
     });
     const eventId: string = created?.event?.event_id || '';
     let meetingUrl: string = created?.event?.vchat?.meeting_url || '';
 
-    // 邀请 HR：优先用传入 open_id，其次用邮箱换 open_id，再不行用外部邮箱参会人
+    // 邀请 HR：优先用传入 open_id，其次用邮箱换 open_id；换不到才回退外部邮箱（仅邮件通知，不进日历）
+    let hrInvited = false;
+    let hrInviteWarn = '';
     if ((opts.hrOpenId || opts.hrEmail) && eventId) {
       const openId = opts.hrOpenId || (opts.hrEmail ? await this.openIdByEmail(opts.hrEmail) : '');
-      const attendee = openId
+      const asUser = !!openId;
+      const attendee = asUser
         ? { type: 'user', user_id: openId }
         : { type: 'third_party', third_party_email: opts.hrEmail };
+      if (!asUser) {
+        hrInviteWarn = `未换到 HR open_id（邮箱=${opts.hrEmail || '(空)'}），回退外部邮箱邀请，日程不会进 HR 飞书日历——请确认 HR 用飞书内部账号邮箱且已开 contact:user.id:readonly 权限`;
+        this.logger.warn(`[约面日程] ${hrInviteWarn}`);
+      }
       try {
         await this.req(
           'POST',
           `/open-apis/calendar/v4/calendars/${cal}/events/${eventId}/attendees`,
           { attendees: [attendee], need_notification: true },
         );
+        hrInvited = asUser; // 只有以飞书用户身份邀请，才算真正进 HR 日历 + 有管理权
       } catch (e: any) {
-        this.logger.warn(`邀请 HR 参会失败 ${opts.hrEmail}: ${e?.message}`);
+        const detail = e?.response?.data ? JSON.stringify(e.response.data) : e?.message;
+        hrInviteWarn = `邀请 HR 参会失败：${detail}`;
+        this.logger.warn(`[约面日程] 邀请 HR 参会失败 ${opts.hrEmail || opts.hrOpenId}: ${detail}`);
       }
+    } else if (eventId) {
+      hrInviteWarn = '未提供 HR open_id / 邮箱，未邀请 HR，日程不会进任何 HR 日历';
     }
 
     // 兜底：创建响应未带会议链接时回查一次
@@ -160,7 +183,7 @@ export class FeishuService {
         meetingUrl = got?.event?.vchat?.meeting_url || '';
       } catch { /* 回查失败不阻断，返回空链接 */ }
     }
-    return { eventId, meetingUrl };
+    return { eventId, meetingUrl, hrInvited, hrInviteWarn };
   }
 
   /** 下载某记录某附件字段的文件到本地目录，返回文件路径数组 */
