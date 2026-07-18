@@ -137,6 +137,12 @@ export class ReachService {
   async handleCallback(body: any) {
     // ⚠️ 秒回小组级回调字段都在 data 下：body = { code, data: {...} }（见 known-everything 回调文档）
     const d = body?.data || body;
+    // 回调来源校验：回调 body.data.token 是小组级 token，须与配置的 MIAOHUI_GROUP_TOKEN 一致
+    const groupToken = this.config.get('MIAOHUI_GROUP_TOKEN');
+    if (groupToken && d?.token && d.token !== groupToken) {
+      this.logger.warn('[mh回调] token 不匹配，忽略该回调');
+      return;
+    }
     const id = d?.messageId || d?.requestId || body?.eventId;
     try {
       // 接收消息回调（候选人回复，data.isSelf + data.contactId）→ 由秒懂画布处理，触达服务忽略
