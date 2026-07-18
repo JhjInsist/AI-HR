@@ -55,7 +55,8 @@ button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)
 
   <div class="card">
     <h2>📚 知识库 <span class="tag">Claude 答疑依据</span></h2>
-    <div class="hint" style="margin:0 0 10px">把 QA/FAQ 粘进来（问答对或纯文本都行）。候选人提问时 Claude 只用这里的内容回答，没有的转人工、绝不编造。留空则用内置公司信息。</div>
+    <div class="hint" style="margin:0 0 10px">上传 Excel（第一列=问、第二列=答，自动跳表头）一键导入；也可在下框直接编辑。候选人提问时 Claude 只用这里的内容回答，没有的转人工、绝不编造。</div>
+    <div class="row" style="grid-template-columns:1fr"><div class="inline"><input type="file" id="kbFile" accept=".xlsx,.xls" style="flex:1"/><button type="button" onclick="uploadKb()">上传 Excel 导入</button><span id="kbMsg" style="font-size:12px"></span></div></div>
     <div class="row" style="grid-template-columns:1fr"><textarea id="KNOWLEDGE_BASE" style="min-height:180px" placeholder="例：&#10;Q：公司在哪办公？&#10;A：北京海淀东升大厦A座。&#10;Q：面试是什么形式？&#10;A：线上视频面试，到时发面试链接。"></textarea></div>
   </div>
 
@@ -155,6 +156,17 @@ function delHr(name){
   if(!confirm("删除面试官「"+name+"」？"))return;
   fetch("/admin/hr/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name})})
     .then(function(r){return r.json()}).then(function(d){renderHr(d.list);msg("✓ 已删除 "+name,"ok")}).catch(function(){msg("删除失败","err")});
+}
+function uploadKb(){
+  var f=el("kbFile").files[0];
+  if(!f){el("kbMsg").textContent="请先选 Excel 文件";el("kbMsg").className="err";return}
+  el("kbMsg").textContent="上传解析中...";el("kbMsg").className="";
+  var fd=new FormData();fd.append("file",f);
+  fetch("/admin/knowledge/upload",{method:"POST",body:fd})
+    .then(function(r){return r.json()}).then(function(d){
+      if(d.ok){el("KNOWLEDGE_BASE").value=d.kb;el("kbMsg").textContent="✓ 导入 "+d.count+" 条问答，已保存生效";el("kbMsg").className="ok"}
+      else {el("kbMsg").textContent="✕ "+(d.msg||"导入失败");el("kbMsg").className="err"}
+    }).catch(function(){el("kbMsg").textContent="✕ 上传失败";el("kbMsg").className="err"});
 }
 load();loadHr();
 </script>

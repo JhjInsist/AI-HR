@@ -1,5 +1,7 @@
-import { Controller, Get, Post, Body, Res } from '@nestjs/common';
+import { Controller, Get, Post, Body, Res, UseInterceptors, UploadedFile } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { Response } from 'express';
+import * as XLSX from 'xlsx';
 import { ConfigService } from '../config/config.service';
 import { InsightAdminService, MODEL_GROUPS } from './insight-admin.service';
 import { HrService } from '../hr/hr.service';
@@ -32,6 +34,32 @@ export class AdminController {
   @Post('config')
   async save(@Body() body: Record<string, any>) {
     return { ok: true, config: await this.config.save(body || {}) };
+  }
+
+  /** 上传 Excel 导入知识库：第一列=问、第二列=答，自动跳表头，存入 KNOWLEDGE_BASE */
+  @Post('knowledge/upload')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadKnowledge(@UploadedFile() file: any) {
+    if (!file?.buffer) return { ok: false, msg: '没有收到文件' };
+    try {
+      const wb = XLSX.read(file.buffer, { type: 'buffer' });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+      const qa: string[] = [];
+      for (const r of rows) {
+        const q = String(r?.[0] ?? '').trim();
+        const a = String(r?.[1] ?? '').trim();
+        if (!q || !a) continue;
+        if (/^(问题?|question)$/i.test(q) && /^(答案?|回答|answer)$/i.test(a)) continue; // 跳表头
+        qa.push(`Q：${q}\nA：${a}`);
+      }
+      if (!qa.length) return { ok: false, msg: '没解析到问答（确认第一列是问、第二列是答）' };
+      const kb = qa.join('\n');
+      await this.config.save({ KNOWLEDGE_BASE: kb });
+      return { ok: true, count: qa.length, kb };
+    } catch (e: any) {
+      return { ok: false, msg: `解析失败：${e?.message}` };
+    }
   }
 
   // ── 面试官 HR 名录：姓名 ↔ 飞书邮箱，约面按面试官选人建日程 ──
