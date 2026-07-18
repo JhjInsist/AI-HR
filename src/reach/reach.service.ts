@@ -147,6 +147,9 @@ export class ReachService {
     if (!(await this.lock(`reach:create:${phone}`, 60))) {
       return { ok: false, msg: '该手机号触达刚发起过，请勿重复', duplicate: true };
     }
+    // 重新触达：清掉该号旧任务，保证一个号同时只有一条活跃触达，避免好友通过/消息回调关联到旧任务
+    const removed = await this.taskModel.deleteMany({ phone }).exec();
+    if (removed.deletedCount) this.logger.log(`[触达] ${phone} 清理旧任务 ${removed.deletedCount} 条后重新触达`);
 
     const taskId = `RT${Date.now()}${Math.floor(Math.random() * 1000)}`;
     const hrBotUserId = this.config.get('MIAOHUI_BOT_USERID', 'jiahongjia');
