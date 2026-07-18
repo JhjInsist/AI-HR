@@ -8,6 +8,7 @@ import { MiaohuiService } from '../miaohui/miaohui.service';
 import { HrService } from '../hr/hr.service';
 import { LlmService } from '../llm/llm.service';
 import { extractTime } from '../miaodong/miaodong.service';
+import { TableService } from '../table/table.service';
 import { ReachTask, ReachStatus, ReachTaskDocument } from './reach.schema';
 import { REACH_REDIS } from './reach.module';
 
@@ -115,6 +116,7 @@ export class ReachService {
     private readonly miaohui: MiaohuiService,
     private readonly hr: HrService,
     private readonly llm: LlmService,
+    private readonly table: TableService,
   ) {}
 
   // ── 幂等锁：SET key NX EX；Redis 不可用时不阻断业务（返回可继续） ──
@@ -168,8 +170,8 @@ export class ReachService {
       doc.status = ReachStatus.ADD_FAILED;
       await doc.save();
       await this.appendTimeline(taskId, 'ADD_FAILED', `发起加好友失败 code=${res.code}`);
-      await this.notifyHr(`❌【触达失败】${dto.name || phone} 加好友请求发送失败（code=${res.code}），请HR人工处理。`);
-      await this.backfillProgress(doc, `触达失败：加好友请求发送失败(code=${res.code})`);
+      await this.requestHandover(doc, 'SEND_FAILED', `加好友请求发送失败(code=${res.code})`);
+      await this.backfillProgress(doc, `触达失败：加好友请求发送失败(code=${res.code})`, 'ADD_FAILED');
       return { ok: false, taskId, msg: '加好友发起失败', code: res.code };
     }
     await this.appendTimeline(taskId, 'ADD_SENT', `已发起加好友 code=${res.code}`);
@@ -286,13 +288,17 @@ export class ReachService {
     await task.save();
     await this.appendTimeline(task.taskId, `INTENT_${intent}`, given || '');
     const who = task.name || task.phone;
-    const notifyMap: Record<string, string> = {
-      [ReachStatus.INTENT_ACCEPT]: `✅【候选人确认】${who} 确认面试${given ? `：${given}` : ''}${meetingLink ? `\n会议链接：${meetingLink}` : ''}`,
-      [ReachStatus.INTENT_RESCHEDULE]: `🔄【候选人改约】${who} 希望调整面试时间，请HR协调。`,
-      [ReachStatus.INTENT_REJECT]: `🚫【候选人拒绝】${who} 婉拒本次面试，流程关闭。`,
-    };
-    if (notifyMap[status]) await this.notifyHr(notifyMap[status]);
-    await this.backfillProgress(task, note || `候选人意图=${intent}`);
+    // 确认→通知HR；改约/拒绝/知识库答不上→转人工（表格服务置「转人工=是」+通知HR）
+    if (status === ReachStatus.INTENT_ACCEPT) {
+      await this.notifyHr(`✅【候选人确认】${who} 确认面试${given ? `：${given}` : ''}${meetingLink ? `\n会议链接：${meetingLink}` : ''}`);
+    } else if (status === ReachStatus.INTENT_RESCHEDULE) {
+      await this.requestHandover(task, 'RESCHEDULE', '候选人想改约，需HR协调新时间', text);
+    } else if (status === ReachStatus.INTENT_REJECT) {
+      await this.requestHandover(task, 'REJECT', '候选人婉拒本次面试', text);
+    } else if (intent === 'QUESTION' && /转人工/.test(reply)) {
+      await this.requestHandover(task, 'KB_MISS', `候选人问到知识库未覆盖的问题：${text.slice(0, 40)}`, text);
+    }
+    await this.backfillProgress(task, note || `候选人意图=${intent}`, `INTENT_${intent}`);
   }
 
   /** 从消息回调提取文本内容 */
@@ -328,8 +334,8 @@ export class ReachService {
       task.status = ReachStatus.ADD_FAILED;
       await task.save();
       await this.appendTimeline(task.taskId, 'ADD_FAILED', `加好友失败 errorCode=${body.errorCode ?? body.code}`);
-      await this.notifyHr(`❌【触达失败】${task.name || task.phone} 加好友未成功（errorCode=${body.errorCode ?? body.code}），请HR人工处理。`);
-      await this.backfillProgress(task, `触达失败：加好友未成功(errorCode=${body.errorCode ?? body.code})`);
+      await this.requestHandover(task, 'SEND_FAILED', `加好友未成功(errorCode=${body.errorCode ?? body.code})`);
+      await this.backfillProgress(task, `触达失败：加好友未成功(errorCode=${body.errorCode ?? body.code})`, 'ADD_FAILED');
     } else {
       await this.appendTimeline(task.taskId, 'ADD_OK', `加好友请求已受理 code=${body.code}`);
     }
@@ -342,8 +348,12 @@ export class ReachService {
     const task = await this.findTask(body);
     const who = task ? (task.name || task.phone) : (body.phoneNum || '某候选人');
     if (body.sentStatus === false) {
-      if (task) await this.appendTimeline(task.taskId, 'SEND_FAILED', `发消息失败 ${body.reason || ''}`);
-      await this.notifyHr(`⚠️【发送失败】给 ${who} 发送消息失败，请HR关注。`);
+      if (task) {
+        await this.appendTimeline(task.taskId, 'SEND_FAILED', `发消息失败 ${body.reason || ''}`);
+        await this.requestHandover(task, 'SEND_FAILED', `给候选人发送消息失败 ${body.reason || ''}`);
+      } else {
+        await this.notifyHr(`⚠️【发送失败】给 ${who} 发送消息失败，请HR关注。`);
+      }
     } else if (task) {
       await this.appendTimeline(task.taskId, 'SEND_OK', '消息已送达');
     }
@@ -458,31 +468,14 @@ export class ReachService {
    * 有面试官 → 查 HR 名录拿 {email, openId}；名录无此人则回退全局 HR_EMAIL。
    */
   private async resolveHr(task: ReachTaskDocument): Promise<{ email: string; openId: string; interviewer: string }> {
-    let interviewer = (task.interviewer || '').trim();
-    if (!interviewer) interviewer = await this.lookupInterviewer(task);
+    // 面试官只来自 task.interviewer（表格服务经 /reach 传入），触达服务不再查飞书表格
+    const interviewer = (task.interviewer || '').trim();
     if (interviewer) {
       const m = await this.hr.findByName(interviewer);
       if (m && (m.email || m.openId)) return { email: m.email || '', openId: m.openId || '', interviewer };
       this.logger.warn(`[约面日程] HR 名录无面试官「${interviewer}」，回退全局 HR_EMAIL`);
     }
     return { email: this.config.get('HR_EMAIL'), openId: '', interviewer };
-  }
-
-  /** 从进度表按 dataId/phone 找记录，读「一面面试官」姓名（task.interviewer 未传时兜底） */
-  private async lookupInterviewer(task: ReachTaskDocument): Promise<string> {
-    if (!this.PROG_APP || !this.PROG_TBL) return '';
-    try {
-      const rows = await this.feishu.listRecords(this.PROG_APP, this.PROG_TBL);
-      const rec = rows.find((r) => {
-        if (task.dataId && r.record_id === task.dataId) return true;
-        const c = cellText(r.fields['联系方式']) || cellText(r.fields['电话']) || cellText(r.fields['手机号']);
-        return c.includes(task.phone);
-      });
-      return rec ? cellText(rec.fields['一面面试官']) : '';
-    } catch (e: any) {
-      this.logger.warn(`[约面日程] 查进度表面试官失败: ${e?.message}`);
-      return '';
-    }
   }
 
   // ───────────────────────── 公共：定位/通知/回填 ─────────────────────────
@@ -506,26 +499,18 @@ export class ReachService {
     catch (e: any) { this.logger.error(`通知HR失败: ${e?.message}`); }
   }
 
-  /** 回填进度表：按 dataId 优先、回退 phone 定位记录，追加备忘录 */
-  private async backfillProgress(task: ReachTaskDocument, note: string) {
-    if (this.dry) { this.logger.log(`[DRY] 回填进度表 ${task.phone} += ${note}`); return; }
-    if (!this.PROG_APP || !this.PROG_TBL) return;
-    try {
-      const rows = await this.feishu.listRecords(this.PROG_APP, this.PROG_TBL);
-      const rec = rows.find((r) => {
-        if (task.dataId && r.record_id === task.dataId) return true;
-        const contact = cellText(r.fields['联系方式']) || cellText(r.fields['电话']) || cellText(r.fields['手机号']);
-        return contact.includes(task.phone);
-      });
-      if (!rec) { this.logger.warn(`进度表未找到记录 dataId=${task.dataId} phone=${task.phone}，跳过回填`); return; }
-      const prev = cellText(rec.fields['备忘录']);
-      const stamp = new Date().toISOString().slice(5, 16).replace('T', ' ');
-      await this.feishu.updateRecord(this.PROG_APP, this.PROG_TBL, rec.record_id, {
-        '备忘录': `${prev} | [触达 ${stamp}] ${note}`.slice(0, 900),
-      });
-      this.logger.log(`进度表已回填 ${task.phone}：${note}`);
-    } catch (e: any) {
-      this.logger.error(`回填进度表失败 ${task.phone}: ${e?.message}`);
-    }
+  /** 回填进度：改调表格服务（触达服务不再直接写飞书多维表格） */
+  private async backfillProgress(task: ReachTaskDocument, note: string, event = '') {
+    if (this.dry) { this.logger.log(`[DRY] 回填 ${task.phone} [${event || task.status}] ${note}`); return; }
+    await this.table.backfill({
+      dataId: task.dataId, phone: task.phone, event: event || task.status, note,
+      status: task.status, interviewTime: task.interviewTime, meetingLink: task.meetingLink,
+    });
+  }
+
+  /** 转人工：通知表格服务标记「转人工=是」+ 飞书通知HR。触达服务判定需人工时调用 */
+  private async requestHandover(task: ReachTaskDocument, reason: string, reasonText: string, candidateReply?: string) {
+    await this.table.handover({ dataId: task.dataId, phone: task.phone, reason, reasonText, candidateReply });
+    await this.notifyHr(`👤【转人工·${reason}】${task.name || task.phone}：${reasonText}${candidateReply ? `\n候选人原话：${candidateReply}` : ''}`);
   }
 }

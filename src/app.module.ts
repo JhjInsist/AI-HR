@@ -5,8 +5,6 @@ import { ConfigService } from './config/config.service';
 import { FeishuService } from './feishu/feishu.service';
 import { FeishuController } from './feishu/feishu.controller';
 import { MiaohuiService } from './miaohui/miaohui.service';
-import { BotService } from './bot/bot.service';
-import { MiaodongService } from './miaodong/miaodong.service';
 import { ConverseService } from './recruit/converse.service';
 import { AdminController } from './admin/admin.controller';
 import { InsightAdminService } from './admin/insight-admin.service';
@@ -19,6 +17,7 @@ import { AppConfigItem, AppConfigSchema } from './config/config.schema';
 import { HrMapping, HrMappingSchema } from './hr/hr.schema';
 import { HrService } from './hr/hr.service';
 import { LlmService } from './llm/llm.service';
+import { TableService } from './table/table.service';
 
 // ioredis provider（触达编排幂等锁）：lazyConnect 首连失败不崩，锁异常时放行不阻断业务
 const redisProvider = {
@@ -41,9 +40,9 @@ const redisProvider = {
   ],
   controllers: [FeishuController, AdminController, LogicController, ReachController],
   providers: [
-    ConfigService, FeishuService, MiaohuiService, BotService,
-    MiaodongService, ConverseService, InsightAdminService,
-    ReachService, HrService, LlmService, redisProvider,
+    ConfigService, FeishuService, MiaohuiService,
+    ConverseService, InsightAdminService,
+    ReachService, HrService, LlmService, TableService, redisProvider,
   ],
 })
 export class AppModule {}
