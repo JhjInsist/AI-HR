@@ -23,7 +23,7 @@ export class TableService {
     const base = this.base();
     if (!base) { this.logger.log(`[表格服务未配置] backfill ${p.phone} [${p.event}] ${p.note}`); return { ok: false }; }
     try {
-      const { data } = await axios.post(`${base}/progress/backfill`, p, { timeout: 15000 });
+      const { data } = await axios.post(`${base}/progress/backfill`, p, { timeout: 30000 });
       return { ok: data?.ok !== false };
     } catch (e: any) {
       this.logger.error(`回填表格服务失败 ${p.phone}: ${e?.message}`);
@@ -38,7 +38,7 @@ export class TableService {
     const base = this.base();
     if (!base) { this.logger.log(`[表格服务未配置] handover ${p.phone} [${p.reason}] ${p.reasonText}`); return { ok: false }; }
     try {
-      const { data } = await axios.post(`${base}/progress/handover`, p, { timeout: 15000 });
+      const { data } = await axios.post(`${base}/progress/handover`, p, { timeout: 30000 });
       return { ok: data?.ok !== false };
     } catch (e: any) {
       this.logger.error(`转人工通知表格服务失败 ${p.phone}: ${e?.message}`);
