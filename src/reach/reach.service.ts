@@ -59,6 +59,18 @@ export function formatInterviewTimeText(raw?: string): string {
   return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 
+/**
+ * 统一的邀约话术（带姓名+岗位+约面时间+请确认）。
+ * 招聘纯企微场景 wecom-contact-bind 画布触发不可用，故把邀约直接并进加好友申请语，
+ * 好友一通过候选人即看到带时间的完整邀约；候选人回复走画布 receive 意图链。
+ */
+export function buildInviteMessage(name?: string, position?: string, interviewTimeRaw?: string): string {
+  const timeText = formatInterviewTimeText(interviewTimeRaw);
+  const pos = position || '相关';
+  const who = name ? `${name}您好` : '您好';
+  return `${who}~ 我是句子互动招聘助理😊 您应聘的【${pos}】岗位，一面初步约在 ${timeText}。方便的话回复「可以」确认；如需调整，回复您方便的时间就好~`;
+}
+
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
 const INTENT_STATUS: Record<string, ReachStatus> = {
   ACCEPT: ReachStatus.INTENT_ACCEPT, TIME: ReachStatus.INTENT_ACCEPT, 确认: ReachStatus.INTENT_ACCEPT,
@@ -133,7 +145,11 @@ export class ReachService {
       timeline: [{ at: new Date(), event: 'CREATE', detail: `建任务，约面时间=${dto.interviewTime || '未填'}` }],
     });
 
-    const hello = this.config.get('HELLO_MSG', '你好，我是句子互动招聘助理，看到你投递的岗位，想跟你约一次面试~');
+    // 邀约并进加好友申请语：有约面时间则用带时间的完整邀约，好友一通过即看到（不依赖画布触发）
+    const hasTime = parseInterviewTime(dto.interviewTime) != null;
+    const hello = hasTime
+      ? buildInviteMessage(dto.name, dto.position, dto.interviewTime)
+      : this.config.get('HELLO_MSG', '你好，我是句子互动招聘助理，看到你投递的岗位，想跟你约一次面试~');
     const res = await this.miaohui.addFriendByPhone(phone, hello, { extraInfo: taskId, userId: hrBotUserId });
     if (!res.ok) {
       doc.status = ReachStatus.ADD_FAILED;
@@ -238,11 +254,7 @@ export class ReachService {
       await this.appendTimeline(task.taskId, 'WELCOMED', `画布取约面信息发欢迎语${ext ? ` contactId=${ext}` : ''}`);
     }
     if (dirty) await task.save();
-    const timeText = formatInterviewTimeText(task.interviewTime);
-    const pos = task.position || '相关';
-    const welcome = task.name
-      ? `${task.name}您好~ 我是句子互动招聘助理😊 您应聘的【${pos}】岗位，一面已初步为您安排在 ${timeText}。请问这个时间方便吗？方便的话回复「可以」确认即可；如需调整，直接回复您方便的时间就好~`
-      : `您好~ 我是句子互动招聘助理😊 您的一面已初步安排在 ${timeText}。请问这个时间方便吗？方便回复「可以」确认，需调整请回复您方便的时间~`;
+    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime);
     return { found: true, name: task.name, position: task.position, interviewTime: task.interviewTime, welcome };
   }
 
