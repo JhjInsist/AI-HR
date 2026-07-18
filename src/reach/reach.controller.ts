@@ -18,6 +18,13 @@ export class ReachController {
     return this.reachSvc.createTask(body || ({} as CreateReachDto));
   }
 
+  /** 改期直推：表格服务在面试时间被改后调用 → {dataId?|phone?, interviewTime, round?} */
+  @Post('notify')
+  async notify(@Body() body: { dataId?: string; phone?: string; interviewTime?: string; round?: string }) {
+    return this.reachSvc.notifyTimeChange((body?.dataId || '').trim(), (body?.phone || '').trim(),
+      (body?.interviewTime || '').toString(), body?.round);
+  }
+
   /** 反向转人工：表格服务同步进度表【转人工】开关（HR 手动勾选/取消）→ {dataId, handover} */
   @Post('handover')
   async handover(@Body() body: { dataId?: string; handover?: boolean }) {

@@ -65,6 +65,9 @@ export class ReachTask {
   @Prop()
   chatId: string;                      // 发消息寻址用
 
+  @Prop({ default: '一面' })
+  round: string;                       // 面试轮次:一面/二面/三面(话术按轮次说话)
+
   @Prop({ default: false, index: true })
   humanTakeover: boolean;              // 转人工：true=AI 不接待此对话，HR 真人跟进（表格【转人工】字段同步来）
 

@@ -20,6 +20,8 @@ export interface CreateReachDto {
   name?: string;
   position?: string;
   interviewer?: string; // 一面面试官姓名（建日程按此查 HR 名录，可不传→兜底查进度表）
+  wxid?: string;        // 联系方式是微信号时传(HR人工校正场景)：按微信号搜索加友，跳过手机号校验
+  round?: string;       // 面试轮次：一面(默认)/二面/三面，话术按轮次说话
 }
 
 function cellText(v: any): string {
@@ -67,14 +69,15 @@ export function formatInterviewTimeText(raw?: string): string {
  * 招聘纯企微场景 wecom-contact-bind 画布触发不可用，故把邀约直接并进加好友申请语，
  * 好友一通过候选人即看到带时间的完整邀约；候选人回复走画布 receive 意图链。
  */
-export function buildInviteMessage(name?: string, position?: string, interviewTimeRaw?: string, template?: string): string {
+export function buildInviteMessage(name?: string, position?: string, interviewTimeRaw?: string, template?: string, round?: string): string {
   const timeText = formatInterviewTimeText(interviewTimeRaw);
   const pos = position || '相关';
   const nm = name || '您';
+  const rd = round || '一面';
   const tpl = template && template.trim()
     ? template
-    : '{name}您好~ 我是句子互动招聘助理😊 您应聘的【{position}】岗位，一面初步约在 {time}。方便的话回复「可以」确认；如需调整，回复您方便的时间就好~';
-  return tpl.replace(/\{name\}/g, nm).replace(/\{position\}/g, pos).replace(/\{time\}/g, timeText);
+    : '{name}您好~ 我是句子互动招聘助理😊 您应聘的【{position}】岗位，{round}初步约在 {time}。方便的话回复「可以」确认；如需调整，回复您方便的时间就好~';
+  return tpl.replace(/\{name\}/g, nm).replace(/\{position\}/g, pos).replace(/\{time\}/g, timeText).replace(/\{round\}/g, rd);
 }
 
 /** 开场白（好友通过后发，探面试意向，不带具体时间）。占位符 {name} {position} */
@@ -140,35 +143,41 @@ export class ReachService {
   // ───────────────────────── ① 发起触达 ─────────────────────────
   /** 建任务(ADDING) → 秒回加好友(extraInfo=taskId, userId=hrBotUserId) → 记 timeline */
   async createTask(dto: CreateReachDto) {
+    // 联系方式=「能联系上候选人的微信号」：默认手机号即微信号；HR 人工校正后可能是微信号(wxid)。
+    // 企微加好友本就支持手机号/微信号搜索，两种都把值当搜索词发给秒回。
+    const wxid = (dto.wxid || '').trim();
     const phone = (dto.phone || '').trim();
-    if (!/^1[3-9]\d{9}$/.test(phone)) return { ok: false, msg: '缺少或非法手机号 phone' };
+    const contact = wxid || phone;
+    if (!wxid && !/^1[3-9]\d{9}$/.test(phone)) return { ok: false, msg: '缺少或非法手机号 phone(微信号请传 wxid)' };
+    if (!contact) return { ok: false, msg: '缺少联系方式' };
 
     // 幂等：同号短时间内只建一次任务
-    if (!(await this.lock(`reach:create:${phone}`, 60))) {
-      return { ok: false, msg: '该手机号触达刚发起过，请勿重复', duplicate: true };
+    if (!(await this.lock(`reach:create:${contact}`, 60))) {
+      return { ok: false, msg: '该联系方式触达刚发起过，请勿重复', duplicate: true };
     }
     // 重新触达：清掉该号旧任务，保证一个号同时只有一条活跃触达，避免好友通过/消息回调关联到旧任务
-    const removed = await this.taskModel.deleteMany({ phone }).exec();
-    if (removed.deletedCount) this.logger.log(`[触达] ${phone} 清理旧任务 ${removed.deletedCount} 条后重新触达`);
+    const removed = await this.taskModel.deleteMany({ $or: [{ phone: contact }, { phone }, ...(dto.dataId ? [{ dataId: dto.dataId }] : [])] }).exec();
+    if (removed.deletedCount) this.logger.log(`[触达] ${contact} 清理旧任务 ${removed.deletedCount} 条后重新触达`);
 
     const taskId = `RT${Date.now()}${Math.floor(Math.random() * 1000)}`;
     const hrBotUserId = this.config.get('MIAOHUI_BOT_USERID', 'jiahongjia');
     const doc = await this.taskModel.create({
       taskId,
       dataId: dto.dataId || '',
-      phone,
+      phone: contact,
       name: dto.name || '',
       position: dto.position || '',
       interviewer: dto.interviewer || '',
       interviewTime: dto.interviewTime || '',
+      round: dto.round || '一面',
       hrBotUserId,
       status: ReachStatus.ADDING,
-      timeline: [{ at: new Date(), event: 'CREATE', detail: `建任务，约面时间=${dto.interviewTime || '未填'}` }],
+      timeline: [{ at: new Date(), event: 'CREATE', detail: `建任务(${dto.round || '一面'})，联系方式=${wxid ? '微信号' : '手机号'}，约面时间=${dto.interviewTime || '未填'}` }],
     });
 
     // 打招呼(加好友申请语)只做简单自我介绍；欢迎语(带约面时间+请确认)在好友通过后单独发
     const hello = this.config.get('HELLO_MSG', '你好，我是句子互动招聘助理，看到你投递的简历，想加你了解一下~');
-    const res = await this.miaohui.addFriendByPhone(phone, hello, { extraInfo: taskId, userId: hrBotUserId });
+    const res = await this.miaohui.addFriendByPhone(contact, hello, { extraInfo: taskId, userId: hrBotUserId });
     if (!res.ok) {
       doc.status = ReachStatus.ADD_FAILED;
       await doc.save();
@@ -179,6 +188,28 @@ export class ReachService {
     }
     await this.appendTimeline(taskId, 'ADD_SENT', `已发起加好友 code=${res.code}`);
     return { ok: true, taskId, status: ReachStatus.ADDING };
+  }
+
+  // ───────────────────────── ①.6 改期直推（表格 → 触达）─────────────────────────
+  /** 表格服务在面试时间被改后调用：直接给已绑定会话的候选人推新时间(不重走加好友)。
+   *  {dataId?|phone?, interviewTime, round?}。没绑定会话(还没聊过)返回 ok:false,表格服务自行退回重触达。 */
+  async notifyTimeChange(dataId: string, phone: string, interviewTime: string, round?: string) {
+    let task = dataId ? await this.taskModel.findOne({ dataId }).sort({ createdAt: -1 }).exec() : null;
+    if (!task && phone) task = await this.taskModel.findOne({ phone }).sort({ createdAt: -1 }).exec();
+    if (!task) return { ok: false, msg: '找不到触达任务' };
+    if (!task.chatId) return { ok: false, msg: '候选人未绑定会话(还没聊过),无法直发,请退回重触达' };
+    const rd = round || task.round || '一面';
+    const timeText = formatInterviewTimeText(interviewTime);
+    const text = `${task.name || '您'}您好~ 跟您同步一下：您的${rd}面试时间调整为【${timeText}】。方便的话回复「可以」确认；如有冲突，回复您方便的时间就好~`;
+    const r = await this.miaohui.sendText(task.chatId, text);
+    if (!r.ok) return { ok: false, msg: `发送失败 code=${r.code}` };
+    task.interviewTime = interviewTime;
+    task.round = rd;
+    task.status = ReachStatus.WELCOMED;  // 回到"已发邀约待确认"态,候选人回复走原意图链
+    await task.save();
+    await this.appendTimeline(task.taskId, 'RESCHEDULE_NOTIFY', `已推送${rd}改期:${timeText}`);
+    this.logger.log(`[改期直推] ${task.name || task.phone} ${rd}→${timeText}`);
+    return { ok: true, taskId: task.taskId };
   }
 
   // ───────────────────────── ①.5 反向转人工开关（表格 → 触达）─────────────────────────
@@ -272,7 +303,7 @@ export class ReachService {
 
   /** 好友通过后发带时间欢迎语（用 task.chatId 经秒回 /message/send 发） */
   private async sendWelcome(task: ReachTaskDocument) {
-    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'));
+    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'), (task as any).round);
     if (task.chatId) {
       const r = await this.miaohui.sendText(task.chatId, welcome);
       this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code}`);
@@ -434,7 +465,7 @@ export class ReachService {
       await this.appendTimeline(task.taskId, 'WELCOMED', `画布取约面信息发欢迎语${ext ? ` contactId=${ext}` : ''}`);
     }
     if (dirty) await task.save();
-    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime);
+    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, undefined, (task as any).round);
     return { found: true, name: task.name, position: task.position, interviewTime: task.interviewTime, welcome };
   }
 
