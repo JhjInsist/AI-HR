@@ -19,6 +19,8 @@ export class AdminController {
 
   @Get()
   page(@Res() res: Response) {
+    // 禁用缓存：配置台页面随代码迭代，避免浏览器用旧 JS（曾导致相对 fetch 路径 bug 复现）
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     res.type('html').send(ADMIN_HTML);
   }
 
