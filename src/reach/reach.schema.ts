@@ -45,6 +45,9 @@ export class ReachTask {
   position: string;
 
   @Prop()
+  interviewer: string;                 // 一面面试官姓名（约面按此查 HR 名录建日程）
+
+  @Prop()
   interviewTime: string;
 
   @Prop()

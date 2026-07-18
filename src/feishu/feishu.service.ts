@@ -114,7 +114,8 @@ export class FeishuService {
    * @returns { eventId, meetingUrl }（meetingUrl 可能为空，调用方按空处理）
    */
   async createInterviewEvent(opts: {
-    hrEmail: string;
+    hrEmail?: string;
+    hrOpenId?: string;
     summary: string;
     startTime: number;
     endTime: number;
@@ -135,9 +136,9 @@ export class FeishuService {
     const eventId: string = created?.event?.event_id || '';
     let meetingUrl: string = created?.event?.vchat?.meeting_url || '';
 
-    // 邀请 HR：优先按 open_id，取不到则用外部邮箱参会人
-    if (opts.hrEmail && eventId) {
-      const openId = await this.openIdByEmail(opts.hrEmail);
+    // 邀请 HR：优先用传入 open_id，其次用邮箱换 open_id，再不行用外部邮箱参会人
+    if ((opts.hrOpenId || opts.hrEmail) && eventId) {
+      const openId = opts.hrOpenId || (opts.hrEmail ? await this.openIdByEmail(opts.hrEmail) : '');
       const attendee = openId
         ? { type: 'user', user_id: openId }
         : { type: 'third_party', third_party_email: opts.hrEmail };

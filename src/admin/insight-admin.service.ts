@@ -105,7 +105,7 @@ export class InsightAdminService {
     const chatBot = this.config.get('CHAT_BOT_ID');
     await this.rebuild(intentBot, SYS_INTENT, model, 0);
     await this.rebuild(chatBot, SYS_CHAT, model, 0.3);
-    this.config.save({ MODEL: model });
+    await this.config.save({ MODEL: model });
     return { intent: intentBot, chat: chatBot };
   }
 

@@ -74,6 +74,21 @@ button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)
     <div class="row"><label><b>HR 飞书邮箱</b>约上后建面试日程并邀HR参会</label><input id="HR_EMAIL" placeholder="hr@juzibot.com"/></div>
     <div class="row"><label><b>HR 通知会话</b>触达失败/需人工时通知(chat_id oc_...)</label><input id="HR_NOTIFY_CHAT" placeholder="oc_..."/></div>
   </div>
+
+  <div class="card">
+    <h2>👥 面试官 HR 名录 <span class="tag">姓名↔飞书邮箱，约面按面试官建日程</span></h2>
+    <div class="hint" style="margin:0 0 10px">姓名须与进度表「一面面试官」写法完全一致才能匹配；匹配不到时回退上面的默认 HR 邮箱。只填姓名+邮箱即可，open_id 系统用邮箱自动换。</div>
+    <div id="hrList"></div>
+    <div class="row">
+      <label><b>新增/更新面试官</b>姓名 / 邮箱 / 备注</label>
+      <div class="inline">
+        <input id="hrName" placeholder="姓名(同进度表面试官)"/>
+        <input id="hrEmail_new" placeholder="飞书邮箱"/>
+        <input id="hrNote" placeholder="备注(可选)"/>
+        <button type="button" onclick="addHr()">保存</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="bar"><div class="inner"><button type="button" onclick="save()">保存配置</button><span id="msg"></span></div></div>
@@ -108,7 +123,34 @@ function applyModel(){
     .then(function(r){return r.json()}).then(function(d){msg(d.ok?("✓ "+d.msg):("✕ "+d.msg),d.ok?"ok":"err")})
     .catch(function(){msg("切换失败","err")});
 }
-load();
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function renderHr(list){
+  var box=el("hrList");box.innerHTML="";
+  if(!list||!list.length){box.innerHTML='<div class="hint" style="padding:6px 0">（暂无面试官，下面添加）</div>';return}
+  list.forEach(function(h){
+    var row=document.createElement("div");row.className="row";row.style.gridTemplateColumns="1fr";
+    var wrap=document.createElement("div");wrap.className="inline";wrap.style.justifyContent="space-between";
+    var span=document.createElement("span");
+    span.innerHTML='<b>'+esc(h.name)+'</b> <span style="color:var(--sub)">'+esc(h.email||"（未填邮箱）")+(h.note?" · "+esc(h.note):"")+'</span>';
+    var btn=document.createElement("button");btn.className="ghost";btn.type="button";btn.textContent="删除";
+    btn.onclick=function(){delHr(h.name)};
+    wrap.appendChild(span);wrap.appendChild(btn);row.appendChild(wrap);box.appendChild(row);
+  });
+}
+function loadHr(){fetch("hr").then(function(r){return r.json()}).then(renderHr).catch(function(){})}
+function addHr(){
+  var name=el("hrName").value.trim();if(!name){msg("请先填面试官姓名","err");return}
+  fetch("hr",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,email:el("hrEmail_new").value.trim(),note:el("hrNote").value.trim()})})
+    .then(function(r){return r.json()}).then(function(d){
+      if(d.ok){el("hrName").value="";el("hrEmail_new").value="";el("hrNote").value="";renderHr(d.list);msg("✓ 已保存 "+name,"ok")}
+      else msg(d.msg||"保存失败","err")});
+}
+function delHr(name){
+  if(!confirm("删除面试官「"+name+"」？"))return;
+  fetch("hr/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name})})
+    .then(function(r){return r.json()}).then(function(d){renderHr(d.list);msg("✓ 已删除 "+name,"ok")}).catch(function(){msg("删除失败","err")});
+}
+load();loadHr();
 </script>
 </body>
 </html>`;

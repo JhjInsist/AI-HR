@@ -15,6 +15,9 @@ import { ReachController } from './reach/reach.controller';
 import { ReachService } from './reach/reach.service';
 import { ReachTask, ReachTaskSchema } from './reach/reach.schema';
 import { REACH_REDIS } from './reach/reach.module';
+import { AppConfigItem, AppConfigSchema } from './config/config.schema';
+import { HrMapping, HrMappingSchema } from './hr/hr.schema';
+import { HrService } from './hr/hr.service';
 
 // ioredis provider（触达编排幂等锁）：lazyConnect 首连失败不崩，锁异常时放行不阻断业务
 const redisProvider = {
@@ -29,13 +32,17 @@ const redisProvider = {
 @Module({
   imports: [
     MongooseModule.forRoot(process.env.MONGO_URI || 'mongodb://localhost:27017/aihr'),
-    MongooseModule.forFeature([{ name: ReachTask.name, schema: ReachTaskSchema }]),
+    MongooseModule.forFeature([
+      { name: ReachTask.name, schema: ReachTaskSchema },
+      { name: AppConfigItem.name, schema: AppConfigSchema },
+      { name: HrMapping.name, schema: HrMappingSchema },
+    ]),
   ],
   controllers: [FeishuController, AdminController, LogicController, ReachController],
   providers: [
     ConfigService, FeishuService, MiaohuiService, BotService,
     MiaodongService, ConverseService, InsightAdminService,
-    ReachService, redisProvider,
+    ReachService, HrService, redisProvider,
   ],
 })
 export class AppModule {}

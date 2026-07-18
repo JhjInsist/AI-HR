@@ -5,6 +5,7 @@ import type { Redis } from 'ioredis';
 import { ConfigService } from '../config/config.service';
 import { FeishuService } from '../feishu/feishu.service';
 import { MiaohuiService } from '../miaohui/miaohui.service';
+import { HrService } from '../hr/hr.service';
 import { ReachTask, ReachStatus, ReachTaskDocument } from './reach.schema';
 import { REACH_REDIS } from './reach.module';
 
@@ -15,6 +16,7 @@ export interface CreateReachDto {
   interviewTime?: string;
   name?: string;
   position?: string;
+  interviewer?: string; // 一面面试官姓名（建日程按此查 HR 名录，可不传→兜底查进度表）
 }
 
 function cellText(v: any): string {
@@ -73,6 +75,7 @@ export class ReachService {
     private readonly config: ConfigService,
     private readonly feishu: FeishuService,
     private readonly miaohui: MiaohuiService,
+    private readonly hr: HrService,
   ) {}
 
   // ── 幂等锁：SET key NX EX；Redis 不可用时不阻断业务（返回可继续） ──
@@ -112,6 +115,7 @@ export class ReachService {
       phone,
       name: dto.name || '',
       position: dto.position || '',
+      interviewer: dto.interviewer || '',
       interviewTime: dto.interviewTime || '',
       hrBotUserId,
       status: ReachStatus.ADDING,
@@ -269,20 +273,22 @@ export class ReachService {
       await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', `约面时间无法解析：${raw}`);
       return '';
     }
-    const hrEmail = this.config.get('HR_EMAIL');
-    if (!hrEmail) {
-      this.logger.warn(`[约面日程] 未配置 HR_EMAIL，跳过建日程 task=${task.taskId}`);
-      await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', '未配置 HR_EMAIL');
+    // 选面试官 HR：按面试官姓名查名录拿邮箱/openId，回退全局 HR_EMAIL
+    const { email: hrEmail, openId: hrOpenId, interviewer } = await this.resolveHr(task);
+    if (!hrEmail && !hrOpenId) {
+      this.logger.warn(`[约面日程] 未匹配到 HR（面试官=${interviewer || '未知'}）且无 HR_EMAIL，跳过建日程 task=${task.taskId}`);
+      await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', `未匹配到 HR（面试官=${interviewer || '未知'}）`);
       return '';
     }
     const end = start + 60 * 60 * 1000; // 结束=开始+1小时
     try {
       const { eventId, meetingUrl } = await this.feishu.createInterviewEvent({
         hrEmail,
+        hrOpenId,
         summary: `面试-${task.name || task.phone}-${task.position || '岗位待定'}`,
         startTime: start,
         endTime: end,
-        description: `候选人：${task.name || ''}（${task.phone}）\n岗位：${task.position || ''}`,
+        description: `候选人：${task.name || ''}（${task.phone}）\n岗位：${task.position || ''}\n面试官：${interviewer || '（未指定）'}`,
       });
       task.meetingLink = meetingUrl || '';
       task.scheduleEventId = eventId || '';
@@ -292,6 +298,39 @@ export class ReachService {
     } catch (e: any) {
       this.logger.error(`[约面日程] 建日程失败 task=${task.taskId}: ${e?.message}`);
       await this.appendTimeline(task.taskId, 'SCHEDULE_FAILED', e?.message);
+      return '';
+    }
+  }
+
+  /**
+   * 解析该任务应约给哪个 HR。
+   * 面试官姓名：task.interviewer 优先，空则查进度表「一面面试官」。
+   * 有面试官 → 查 HR 名录拿 {email, openId}；名录无此人则回退全局 HR_EMAIL。
+   */
+  private async resolveHr(task: ReachTaskDocument): Promise<{ email: string; openId: string; interviewer: string }> {
+    let interviewer = (task.interviewer || '').trim();
+    if (!interviewer) interviewer = await this.lookupInterviewer(task);
+    if (interviewer) {
+      const m = await this.hr.findByName(interviewer);
+      if (m && (m.email || m.openId)) return { email: m.email || '', openId: m.openId || '', interviewer };
+      this.logger.warn(`[约面日程] HR 名录无面试官「${interviewer}」，回退全局 HR_EMAIL`);
+    }
+    return { email: this.config.get('HR_EMAIL'), openId: '', interviewer };
+  }
+
+  /** 从进度表按 dataId/phone 找记录，读「一面面试官」姓名（task.interviewer 未传时兜底） */
+  private async lookupInterviewer(task: ReachTaskDocument): Promise<string> {
+    if (!this.PROG_APP || !this.PROG_TBL) return '';
+    try {
+      const rows = await this.feishu.listRecords(this.PROG_APP, this.PROG_TBL);
+      const rec = rows.find((r) => {
+        if (task.dataId && r.record_id === task.dataId) return true;
+        const c = cellText(r.fields['联系方式']) || cellText(r.fields['电话']) || cellText(r.fields['手机号']);
+        return c.includes(task.phone);
+      });
+      return rec ? cellText(rec.fields['一面面试官']) : '';
+    } catch (e: any) {
+      this.logger.warn(`[约面日程] 查进度表面试官失败: ${e?.message}`);
       return '';
     }
   }
