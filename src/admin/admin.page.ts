@@ -68,12 +68,18 @@ button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)
     <div class="row"><label><b>招聘企微号</b>userId</label><input id="MIAOHUI_BOT_USERID" placeholder="jiahongjia"/></div>
     <div class="row"><label><b>机器人名字</b>群里@它触发</label><input id="FEISHU_BOT_NAME" placeholder="秒聘"/></div>
   </div>
+
+  <div class="card">
+    <h2>👤 HR 通知 & 日程 <span class="tag">同步HR + 建面试日程</span></h2>
+    <div class="row"><label><b>HR 飞书邮箱</b>约上后建面试日程并邀HR参会</label><input id="HR_EMAIL" placeholder="hr@juzibot.com"/></div>
+    <div class="row"><label><b>HR 通知会话</b>触达失败/需人工时通知(chat_id oc_...)</label><input id="HR_NOTIFY_CHAT" placeholder="oc_..."/></div>
+  </div>
 </div>
 
 <div class="bar"><div class="inner"><button type="button" onclick="save()">保存配置</button><span id="msg"></span></div></div>
 
 <script>
-var FIELDS=["AIHR_APP_TOKEN","AIHR_TABLE_ID","PROG_APP_TOKEN","PROG_TABLE_ID","INTENT_BOT_ID","CHAT_BOT_ID","MODEL","DRY_RUN","INTERVIEW_LINK","HELLO_MSG","POLL_INTERVAL_SEC","MIAOHUI_GROUP_TOKEN","MIAOHUI_CORP_ID","MIAOHUI_BOT_USERID","FEISHU_BOT_NAME"];
+var FIELDS=["AIHR_APP_TOKEN","AIHR_TABLE_ID","PROG_APP_TOKEN","PROG_TABLE_ID","INTENT_BOT_ID","CHAT_BOT_ID","MODEL","DRY_RUN","INTERVIEW_LINK","HELLO_MSG","POLL_INTERVAL_SEC","MIAOHUI_GROUP_TOKEN","MIAOHUI_CORP_ID","MIAOHUI_BOT_USERID","FEISHU_BOT_NAME","HR_EMAIL","HR_NOTIFY_CHAT"];
 function el(id){return document.getElementById(id)}
 function msg(t,cls){var m=el("msg");m.textContent=t;m.className=cls||""}
 function load(){
