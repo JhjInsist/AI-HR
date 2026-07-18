@@ -98,7 +98,7 @@ export function extractTimeSlot(text: string): { date?: string; part?: string; c
   const date = t.match(/(今天|明天|后天|大后天|下下?周[一二三四五六日天]|周[一二三四五六日天]|礼拜[一二三四五六日天]|\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号])/)?.[1];
   const part = t.match(/(上午|下午|中午|晚上|早上|傍晚)/)?.[1];
   const clock = extractTime(t);
-  const raw = [date, part && !clock?.includes(part) ? part : '', clock].filter(Boolean).join('');
+  const raw = [date && !(clock || '').includes(date) ? date : '', part && !(clock || '').includes(part) ? part : '', clock].filter(Boolean).join('');
   return { date, part, clock, full: !!(date && (part || clock)), raw };
 }
 
