@@ -335,12 +335,18 @@ export class ReachService {
     return '';
   }
 
-  /** 好友通过：status=CONFIRMED，存 wxid/externalUserId */
+  /** 好友通过：status=CONFIRMED，存 wxid/externalUserId。
+   *  ⚠️ 限制：只处理【本系统发起】的加好友（extraInfo=本系统 taskId）。
+   *  HR 手动加 / 候选人主动加 / 别的系统加的好友没有 extraInfo，一律不触发约面逻辑。 */
   private async onFriendConfirm(body: any, id?: string) {
     const key = `mh:confirm:${id || body.wxid || body.phoneNum}`;
     if (!(await this.lock(key))) return;
-    const task = await this.findTask(body);
-    if (!task) { this.logger.warn(`[friend/confirm] 未找到任务 phone=${body.phoneNum} extraInfo=${body.extraInfo}`); return; }
+    const extraInfo = (body?.extraInfo || '').trim();
+    const task = extraInfo ? await this.taskModel.findOne({ taskId: extraInfo }).exec() : null;
+    if (!task) {
+      this.logger.log(`[friend/confirm] 非本系统触达（extraInfo=${extraInfo || '无'}），不触发约面 phone=${body.phoneNum}`);
+      return;
+    }
     task.status = ReachStatus.CONFIRMED;
     task.wxid = body.wxid || task.wxid;
     task.externalUserId = body.externalUserId || body.externalUserid || task.externalUserId;
