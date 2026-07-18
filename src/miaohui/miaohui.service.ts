@@ -43,4 +43,22 @@ export class MiaohuiService {
       return { ok: false, code: -98, raw: e?.message?.slice(0, 120) };
     }
   }
+
+  /** 给指定会话发文本消息（小组级开放接口 POST /message/send，messageType=0 纯文本）。
+   *  chatId 来自好友通过/消息回调。返回 {ok, code}。 */
+  async sendText(chatId: string, text: string): Promise<{ ok: boolean; code: number; raw?: any }> {
+    const token = this.config.get('MIAOHUI_GROUP_TOKEN');
+    if (!token) return { ok: false, code: -99, raw: '缺 MIAOHUI_GROUP_TOKEN' };
+    if (!chatId) return { ok: false, code: -97, raw: '缺 chatId' };
+    try {
+      const { data } = await axios.post(
+        `${this.base}/message/send`,
+        { token, chatId, messageType: 0, text },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 },
+      );
+      return { ok: data?.code === 0, code: data?.code, raw: data };
+    } catch (e: any) {
+      return { ok: false, code: -98, raw: e?.message?.slice(0, 120) };
+    }
+  }
 }

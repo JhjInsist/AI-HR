@@ -18,6 +18,7 @@ import { REACH_REDIS } from './reach/reach.module';
 import { AppConfigItem, AppConfigSchema } from './config/config.schema';
 import { HrMapping, HrMappingSchema } from './hr/hr.schema';
 import { HrService } from './hr/hr.service';
+import { LlmService } from './llm/llm.service';
 
 // ioredis provider（触达编排幂等锁）：lazyConnect 首连失败不崩，锁异常时放行不阻断业务
 const redisProvider = {
@@ -42,7 +43,7 @@ const redisProvider = {
   providers: [
     ConfigService, FeishuService, MiaohuiService, BotService,
     MiaodongService, ConverseService, InsightAdminService,
-    ReachService, HrService, redisProvider,
+    ReachService, HrService, LlmService, redisProvider,
   ],
 })
 export class AppModule {}

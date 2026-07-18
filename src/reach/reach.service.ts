@@ -6,6 +6,8 @@ import { ConfigService } from '../config/config.service';
 import { FeishuService } from '../feishu/feishu.service';
 import { MiaohuiService } from '../miaohui/miaohui.service';
 import { HrService } from '../hr/hr.service';
+import { LlmService } from '../llm/llm.service';
+import { extractTime } from '../miaodong/miaodong.service';
 import { ReachTask, ReachStatus, ReachTaskDocument } from './reach.schema';
 import { REACH_REDIS } from './reach.module';
 
@@ -99,6 +101,7 @@ export class ReachService {
     private readonly feishu: FeishuService,
     private readonly miaohui: MiaohuiService,
     private readonly hr: HrService,
+    private readonly llm: LlmService,
   ) {}
 
   // ── 幂等锁：SET key NX EX；Redis 不可用时不阻断业务（返回可继续） ──
@@ -145,11 +148,8 @@ export class ReachService {
       timeline: [{ at: new Date(), event: 'CREATE', detail: `建任务，约面时间=${dto.interviewTime || '未填'}` }],
     });
 
-    // 邀约并进加好友申请语：有约面时间则用带时间的完整邀约，好友一通过即看到（不依赖画布触发）
-    const hasTime = parseInterviewTime(dto.interviewTime) != null;
-    const hello = hasTime
-      ? buildInviteMessage(dto.name, dto.position, dto.interviewTime)
-      : this.config.get('HELLO_MSG', '你好，我是句子互动招聘助理，看到你投递的岗位，想跟你约一次面试~');
+    // 打招呼(加好友申请语)只做简单自我介绍；欢迎语(带约面时间+请确认)在好友通过后单独发
+    const hello = this.config.get('HELLO_MSG', '你好，我是句子互动招聘助理，看到你投递的简历，想加你了解一下~');
     const res = await this.miaohui.addFriendByPhone(phone, hello, { extraInfo: taskId, userId: hrBotUserId });
     if (!res.ok) {
       doc.status = ReachStatus.ADD_FAILED;
@@ -168,6 +168,7 @@ export class ReachService {
   async handleCallback(body: any) {
     // ⚠️ 秒回小组级回调字段都在 data 下：body = { code, data: {...} }（见 known-everything 回调文档）
     const d = body?.data || body;
+    this.logger.log(`[mh回调] 收到回调 keys=${Object.keys(d || {}).join(',')} isSelf=${d?.isSelf} contactId=${d?.contactId || ''} wxid=${d?.wxid || ''} sentStatus=${d?.sentStatus}`);
     // 回调来源校验：回调 body.data.token 是小组级 token，须与配置的 MIAOHUI_GROUP_TOKEN 一致
     const groupToken = this.config.get('MIAOHUI_GROUP_TOKEN');
     if (groupToken && d?.token && d.token !== groupToken) {
@@ -176,8 +177,8 @@ export class ReachService {
     }
     const id = d?.messageId || d?.requestId || body?.eventId;
     try {
-      // 接收消息回调（候选人回复，data.isSelf + data.contactId）→ 由秒懂画布处理，触达服务忽略
-      if (d?.isSelf !== undefined && d?.contactId) return;
+      // 接收消息回调（候选人回复，data.isSelf + data.contactId）→ 服务主导对话（已弃用秒懂画布）
+      if (d?.isSelf !== undefined && d?.contactId) return await this.onMessage(d, id);
       // 发送消息结果回调：带 sentStatus
       if (d?.sentStatus !== undefined) return await this.onSentResult(d, id);
       // 加好友任务结果回调：带 createTimestamp（区别于好友通过，两者都有 code+phoneNum+extraInfo）
@@ -188,6 +189,106 @@ export class ReachService {
     } catch (e: any) {
       this.logger.error(`[mh回调] 处理异常: ${e?.message}`);
     }
+  }
+
+  // ───────────────────────── ③ 服务主导对话（收消息）─────────────────────────
+  /**
+   * 候选人消息回调入口（服务主导，已弃用秒懂画布）。
+   * 好友通过后首条消息 → 发带时间欢迎语；之后的回复 → 大模型意图分类 → 回复+建日程+通知HR+回填。
+   */
+  private async onMessage(d: any, id?: string) {
+    if (d?.isSelf === true) return; // 自己发的消息忽略
+    const chatId = (d?.chatId || '').toString();
+    const extId = (d?.externalUserId || d?.contactId || '').toString().trim();
+    if (!extId) return;
+    if (id && !(await this.lock(`mh:msg:${id}`))) return; // 同消息只处理一次
+    const task = await this.taskModel
+      .findOne({ $or: [{ externalUserId: extId }, { wxid: extId }, { chatId }] })
+      .sort({ createdAt: -1 }).exec();
+    if (!task) { this.logger.log(`[消息] 未匹配触达任务 extId=${extId}`); return; }
+    if (chatId && task.chatId !== chatId) { task.chatId = chatId; await task.save(); }
+    // 好友通过后首条消息 → 发欢迎语（这条通常是加好友打招呼回执，不当作候选人意图）
+    if (task.status === ReachStatus.CONFIRMED || task.status === ReachStatus.ADDING) {
+      await this.sendWelcome(task);
+      return;
+    }
+    const text = this.extractMsgText(d);
+    if (!text) return;
+    await this.handleReply(task, text);
+  }
+
+  /** 好友通过后发带时间欢迎语（用 task.chatId 经秒回 /message/send 发） */
+  private async sendWelcome(task: ReachTaskDocument) {
+    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime);
+    if (task.chatId) {
+      const r = await this.miaohui.sendText(task.chatId, welcome);
+      this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code}`);
+    } else {
+      this.logger.warn(`[欢迎语] task ${task.taskId} 无 chatId，跳过`);
+    }
+    task.status = ReachStatus.WELCOMED;
+    await task.save();
+    await this.appendTimeline(task.taskId, 'WELCOMED', '已发带时间欢迎语');
+  }
+
+  /** 候选人回复 → 大模型意图分类 → 回复 + 建日程 + 通知HR + 回填 */
+  private async handleReply(task: ReachTaskDocument, text: string) {
+    const intent = await this.llm.classifyIntent(text);
+    const given = extractTime(text);
+    let reply = ''; let status: ReachStatus = ReachStatus.REPLIED; let note = '';
+    let meetingLink = task.meetingLink || '';
+    switch (intent) {
+      case 'TIME': {
+        status = ReachStatus.INTENT_ACCEPT;
+        if (!meetingLink) meetingLink = await this.scheduleInterview(task, given ? { time: given } : {});
+        const timeText = given || formatInterviewTimeText(task.interviewTime);
+        reply = `好的，面试就约在【${timeText}】啦~ 线上视频形式${meetingLink ? `，会议链接：${meetingLink}` : '，会议链接稍后发您'}。到时见~`;
+        note = `候选人确认面试时间【${timeText}】`;
+        break;
+      }
+      case 'RESCHEDULE':
+        status = ReachStatus.INTENT_RESCHEDULE;
+        reply = '没问题~ 您方便的时间段是？告诉我大致日期和上午/下午，我帮您协调面试官时间。';
+        note = '候选人想改期，待HR协调';
+        break;
+      case 'REJECT':
+        status = ReachStatus.INTENT_REJECT;
+        reply = '好的，完全理解~ 感谢您的关注，后续有更合适的机会我再联系您。祝一切顺利！';
+        note = '候选人婉拒，流程关闭';
+        break;
+      case 'QUESTION':
+        status = ReachStatus.INTENT_QUESTION;
+        reply = await this.llm.answer(text);
+        note = `候选人提问：${text.slice(0, 30)}`;
+        break;
+      default:
+        status = ReachStatus.REPLIED;
+        reply = await this.llm.answer(text);
+        note = '';
+    }
+    if (task.chatId && reply) await this.miaohui.sendText(task.chatId, reply);
+    task.intent = intent;
+    if (intent !== 'QUESTION') task.status = status;
+    else if (task.status === ReachStatus.WELCOMED) task.status = ReachStatus.REPLIED;
+    await task.save();
+    await this.appendTimeline(task.taskId, `INTENT_${intent}`, given || '');
+    const who = task.name || task.phone;
+    const notifyMap: Record<string, string> = {
+      [ReachStatus.INTENT_ACCEPT]: `✅【候选人确认】${who} 确认面试${given ? `：${given}` : ''}${meetingLink ? `\n会议链接：${meetingLink}` : ''}`,
+      [ReachStatus.INTENT_RESCHEDULE]: `🔄【候选人改约】${who} 希望调整面试时间，请HR协调。`,
+      [ReachStatus.INTENT_REJECT]: `🚫【候选人拒绝】${who} 婉拒本次面试，流程关闭。`,
+    };
+    if (notifyMap[status]) await this.notifyHr(notifyMap[status]);
+    await this.backfillProgress(task, note || `候选人意图=${intent}`);
+  }
+
+  /** 从消息回调提取文本内容 */
+  private extractMsgText(d: any): string {
+    if (typeof d?.text === 'string' && d.text) return d.text;
+    const p = d?.payload;
+    if (typeof p === 'string') return p;
+    if (p && typeof p === 'object') return p.text || p.content || p.msg || '';
+    return '';
   }
 
   /** 好友通过：status=CONFIRMED，存 wxid/externalUserId */

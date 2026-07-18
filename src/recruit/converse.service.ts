@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { MiaodongService } from '../miaodong/miaodong.service';
+import { LlmService } from '../llm/llm.service';
+import { extractTime } from '../miaodong/miaodong.service';
 import { FeishuService } from '../feishu/feishu.service';
 import { ConfigService } from '../config/config.service';
 
@@ -20,10 +21,9 @@ export interface ConverseResult {
 
 /**
  * 触达对话编排（秒聘服务的确定性大脑）。
- * 流程（对齐玄玄）：秒回收到候选人回复 → 秒懂意图分类 → 这里按死规则路由 →
- * 固定模板 or 知识库应答 → 秒回发回；同时把进展确定性写进度表备忘录。
- *
+ * 候选人回复 → 大模型意图分类 → 死规则路由 → 固定模板 or 知识库应答。
  * 模型只碰两件事：意图分类、知识库问答。路由/时间抽取/写表全是代码，杜绝幻觉。
+ * （已从秒懂画布切换为直连大模型 LlmService。）
  */
 @Injectable()
 export class ConverseService {
@@ -34,28 +34,27 @@ export class ConverseService {
   private get LINK() { return this.config.get('INTERVIEW_LINK'); }
 
   constructor(
-    private readonly miaodong: MiaodongService,
+    private readonly llm: LlmService,
     private readonly feishu: FeishuService,
     private readonly config: ConfigService,
   ) {}
 
   /** 处理候选人一条回复。candidate 传姓名可写回进度表；不传则只返回话术不落库。 */
   async handle(text: string, candidate?: string): Promise<ConverseResult> {
-    const { type, value } = await this.miaodong.classify(text);
+    const type = await this.llm.classifyIntent(text);
+    const value = extractTime(text);
     const linkLine = this.LINK ? `\n面试链接：${this.LINK}` : '';
     let res: ConverseResult;
 
     switch (type) {
       case 'TIME':
         if (value) {
-          // 抽到具体时间 → 确认 + 复述时间（让候选人和HR都清楚约的哪天）
           res = {
             intent: type, time: value, action: 'confirm',
             reply: `好的，那就约在【${value}】~ 面试是线上视频形式，到时我会把面试链接发给您，点开进入即可。${linkLine}\n如需调整时间随时跟我说~`,
             note: `候选人确认面试时间【${value}】${this.LINK ? '，已发面试链接' : '，待发面试链接'}`,
           };
         } else {
-          // 有约面意愿但没给具体时间 → 引导给出时间，不能假装约好了
           res = {
             intent: type, action: 'ask_time',
             reply: '好呀~ 您方便哪天、上午还是下午呢？把具体时间告诉我，我这就帮您和面试官约上。',
@@ -78,12 +77,12 @@ export class ConverseService {
         };
         break;
       case 'QUESTION': {
-        const answer = await this.miaodong.chat(text);
+        const answer = await this.llm.answer(text);
         res = { intent: type, action: 'answer', reply: answer, note: `候选人提问：${text.slice(0, 30)}` };
         break;
       }
       default: {
-        const answer = await this.miaodong.chat(text);
+        const answer = await this.llm.answer(text);
         res = { intent: 'OTHER', action: 'fallback', reply: answer, note: '' };
       }
     }
@@ -92,7 +91,7 @@ export class ConverseService {
     return res;
   }
 
-  /** 把进展确定性追加到进度表备忘录（幂等靠内容不同即追加；不改其它字段） */
+  /** 把进展确定性追加到进度表备忘录 */
   private async writeNote(candidate: string, res: ConverseResult) {
     if (!res.note) return;
     if (this.dry) { this.logger.log(`[DRY] ${candidate} 备忘录 += ${res.note}`); return; }
