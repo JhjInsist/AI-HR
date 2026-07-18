@@ -90,6 +90,42 @@ export function buildOpening(name?: string, position?: string, template?: string
   return tpl.replace(/\{name\}/g, nm).replace(/\{position\}/g, pos);
 }
 
+/** 候选人时间表达 → 槽位 {date(哪天), part(半天), clock(钟点)}。full=有日期+至少半天粒度。
+ *  比 extractTime 宽:「周五下午」「明天」这类没钟点的也抓得到(改期收集要按槽位追问)。 */
+export function extractTimeSlot(text: string): { date?: string; part?: string; clock?: string; full: boolean; raw: string } {
+  const t = (text || '').replace(/\s+/g, '');
+  const date = t.match(/(今天|明天|后天|大后天|下下?周[一二三四五六日天]|周[一二三四五六日天]|礼拜[一二三四五六日天]|\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号])/)?.[1];
+  const part = t.match(/(上午|下午|中午|晚上|早上|傍晚)/)?.[1];
+  const clock = extractTime(t);
+  const raw = [date, part && !clock?.includes(part) ? part : '', clock].filter(Boolean).join('');
+  return { date, part, clock, full: !!(date && (part || clock)), raw };
+}
+
+/** 候选人给的时间和当前约定时间是否算"同一场"（同一天且钟点不冲突→确认;否则→改期提案） */
+export function sameAsScheduled(slot: ReturnType<typeof extractTimeSlot>, interviewTimeRaw?: string): boolean {
+  const ms = parseInterviewTime(interviewTimeRaw);
+  if (ms == null) return !slot.date && !slot.clock; // 原时间都没定:候选人没给新时间才算"确认"
+  const d = new Date(ms + 8 * 3600 * 1000);
+  const days = ['日', '一', '二', '三', '四', '五', '六'];
+  const sameDay = !slot.date
+    || slot.date === `周${days[d.getUTCDay()]}` || slot.date === `礼拜${days[d.getUTCDay()]}`
+    || slot.date === `${d.getUTCMonth() + 1}月${d.getUTCDate()}日` || slot.date === `${d.getUTCMonth() + 1}月${d.getUTCDate()}号`;
+  if (!sameDay) return false;
+  if (slot.clock) {
+    const hh = parseInt(slot.clock.match(/(\d{1,2})[:：点时]/)?.[1] || '-1', 10);
+    let sch = d.getUTCHours();
+    const cand12 = hh < 12 && (slot.clock.includes('下午') || slot.clock.includes('晚上')) ? hh + 12 : hh;
+    return cand12 === sch || hh === sch || (sch > 12 && hh === sch - 12);
+  }
+  if (slot.part) {
+    const sch = d.getUTCHours();
+    const map: Record<string, [number, number]> = { 早上: [6, 10], 上午: [6, 12], 中午: [11, 14], 下午: [12, 19], 傍晚: [17, 20], 晚上: [18, 23] };
+    const rg = map[slot.part];
+    return !!rg && sch >= rg[0] && sch <= rg[1];
+  }
+  return true; // 只说"可以/好的"没带任何时间
+}
+
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
 const INTENT_STATUS: Record<string, ReachStatus> = {
   ACCEPT: ReachStatus.INTENT_ACCEPT, TIME: ReachStatus.INTENT_ACCEPT, 确认: ReachStatus.INTENT_ACCEPT,
@@ -319,21 +355,60 @@ export class ReachService {
   private async handleReply(task: ReachTaskDocument, text: string) {
     const intent = await this.llm.classifyIntent(text);
     const given = extractTime(text);
+    const slot = extractTimeSlot(text);
     let reply = ''; let status: ReachStatus = ReachStatus.REPLIED; let note = '';
     let meetingLink = task.meetingLink || '';
+    let expectTime = '';   // 候选人期望的改期时间(带给表格服务→@面试官拍板)
+    if (intent === 'TIME' || intent === 'RESCHEDULE') task.otherStreak = 0;
     switch (intent) {
       case 'TIME': {
+        // 玄玄定的规格:候选人给的时间≠当前约定 → 不是确认,是改期提案 → 不建日程,找面试官拍板
+        if (!sameAsScheduled(slot, task.interviewTime)) {
+          if (slot.full) {
+            status = ReachStatus.INTENT_RESCHEDULE;
+            task.pendingTime = slot.raw;
+            task.rescheduleAsks = 0;
+            expectTime = slot.raw;
+            reply = `收到~【${slot.raw}】我跟面试官确认一下，定了马上回复您哈`;
+            note = `候选人期望改到【${slot.raw}】，待面试官拍板(改一面时间即拍板，会自动通知候选人)`;
+          } else {
+            // 给了时间但不完整(如只说"下周") → 追问补全
+            task.rescheduleAsks = (task.rescheduleAsks || 0) + 1;
+            if (task.rescheduleAsks >= 3) { await this.rescheduleStuck(task, text); return; }
+            status = ReachStatus.INTENT_RESCHEDULE;
+            reply = slot.date
+              ? `好的~ ${slot.date}的话，您上午还是下午方便？大概几点？`
+              : `好的~ 那您看哪天方便？告诉我大致日期和上午/下午就行，我来协调面试官时间`;
+            note = `候选人想改期(时间还不完整:${slot.raw || text.slice(0, 20)})，AI追问中(第${task.rescheduleAsks}轮)`;
+          }
+          break;
+        }
         status = ReachStatus.INTENT_ACCEPT;
+        task.rescheduleAsks = 0; task.pendingTime = '';
         if (!meetingLink) meetingLink = await this.scheduleInterview(task, given ? { time: given } : {});
-        const timeText = given || formatInterviewTimeText(task.interviewTime);
+        const timeText = formatInterviewTimeText(task.interviewTime);
         reply = `好的，面试就约在【${timeText}】啦~ 线上视频形式${meetingLink ? `，会议链接：${meetingLink}` : '，会议链接稍后发您'}。到时见~`;
         note = `候选人确认面试时间【${timeText}】`;
         break;
       }
       case 'RESCHEDULE':
+        // 不再一上来就转人工:先由 AI 追问拿具体时间(最多3轮),拿到了才找面试官确认
+        if (slot.full) {
+          status = ReachStatus.INTENT_RESCHEDULE;
+          task.pendingTime = slot.raw;
+          task.rescheduleAsks = 0;
+          expectTime = slot.raw;
+          reply = `收到~【${slot.raw}】我跟面试官确认一下，定了马上回复您哈`;
+          note = `候选人期望改到【${slot.raw}】，待面试官拍板(改一面时间即拍板，会自动通知候选人)`;
+          break;
+        }
+        task.rescheduleAsks = (task.rescheduleAsks || 0) + 1;
+        if (task.rescheduleAsks >= 3) { await this.rescheduleStuck(task, text); return; }
         status = ReachStatus.INTENT_RESCHEDULE;
-        reply = '没问题~ 您方便的时间段是？告诉我大致日期和上午/下午，我帮您协调面试官时间。';
-        note = '候选人想改期，待HR协调';
+        reply = task.rescheduleAsks === 1
+          ? '没问题~ 您方便的时间段是？告诉我大致日期和上午/下午，我帮您协调面试官时间。'
+          : '好嘞~ 您给个大概就行，比如「周五下午」或者「下周一上午」，我这边去对面试官的时间~';
+        note = `候选人想改期，AI追问具体时间中(第${task.rescheduleAsks}轮)`;
         break;
       case 'REJECT':
         status = ReachStatus.INTENT_REJECT;
@@ -346,6 +421,17 @@ export class ReachService {
         note = `候选人提问：${text.slice(0, 30)}`;
         break;
       default:
+        // 听不懂:连续2次识别不了意图 → 别硬聊,转人工
+        task.otherStreak = (task.otherStreak || 0) + 1;
+        if (task.otherStreak >= 2) {
+          reply = '不好意思哈~ 我让我们招聘同事直接来跟您沟通，稍等一下下~';
+          if (task.chatId) await this.miaohui.sendText(task.chatId, reply);
+          task.status = ReachStatus.HANDOVER;
+          await task.save();
+          await this.requestHandover(task, 'USER_REQUEST', '连续两轮没听懂候选人意图，AI退出', text);
+          await this.backfillProgress(task, `AI连续没听懂候选人(最后原话:${text.slice(0, 30)})，已转人工`, 'HANDOVER');
+          return;
+        }
         status = ReachStatus.REPLIED;
         reply = await this.llm.answer(text);
         note = '';
@@ -367,7 +453,7 @@ export class ReachService {
     } else if (intent === 'QUESTION' && /转人工/.test(reply)) {
       await this.requestHandover(task, 'KB_MISS', `候选人问到知识库未覆盖的问题：${text.slice(0, 40)}`, text);
     }
-    await this.backfillProgress(task, note || `候选人意图=${intent}`, `INTENT_${intent}`);
+    await this.backfillProgress(task, note || `候选人意图=${intent}`, `INTENT_${intent}`, expectTime);
   }
 
   /** 从消息回调提取文本内容 */
@@ -587,12 +673,24 @@ export class ReachService {
   }
 
   /** 回填进度：改调表格服务（触达服务不再直接写飞书多维表格） */
-  private async backfillProgress(task: ReachTaskDocument, note: string, event = '') {
+  private async backfillProgress(task: ReachTaskDocument, note: string, event = '', expectTime = '') {
     if (this.dry) { this.logger.log(`[DRY] 回填 ${task.phone} [${event || task.status}] ${note}`); return; }
     await this.table.backfill({
       dataId: task.dataId, phone: task.phone, event: event || task.status, note,
       status: task.status, interviewTime: task.interviewTime, meetingLink: task.meetingLink,
+      expectTime: expectTime || undefined,
     });
+  }
+
+  /** 改期沟通3轮仍拿不到具体时间 → 不硬聊,转人工(玄玄定的兜底) */
+  private async rescheduleStuck(task: ReachTaskDocument, text: string) {
+    const reply = '好嘞~ 那我让我们招聘同事直接来跟您对时间，稍等一下下哈~';
+    if (task.chatId) await this.miaohui.sendText(task.chatId, reply);
+    task.status = ReachStatus.HANDOVER;
+    await task.save();
+    await this.appendTimeline(task.taskId, 'RESCHEDULE_STUCK', '3轮追问未拿到具体改期时间');
+    await this.requestHandover(task, 'RESCHEDULE', '改期沟通3轮仍未拿到具体时间，请HR人工对时间', text);
+    await this.backfillProgress(task, '改期3轮没对上具体时间，已转人工', 'HANDOVER');
   }
 
   /** 转人工：通知表格服务标记「转人工=是」+ 飞书通知HR。触达服务判定需人工时调用 */

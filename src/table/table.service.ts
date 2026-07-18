@@ -18,7 +18,7 @@ export class TableService {
   /** 回填进度/备忘录 → 表格服务 POST /progress/backfill */
   async backfill(p: {
     dataId?: string; phone: string; event: string; note: string;
-    status?: string; interviewTime?: string; meetingLink?: string;
+    status?: string; interviewTime?: string; meetingLink?: string; expectTime?: string;
   }): Promise<{ ok: boolean }> {
     const base = this.base();
     if (!base) { this.logger.log(`[表格服务未配置] backfill ${p.phone} [${p.event}] ${p.note}`); return { ok: false }; }

@@ -68,6 +68,15 @@ export class ReachTask {
   @Prop({ default: '一面' })
   round: string;                       // 面试轮次:一面/二面/三面(话术按轮次说话)
 
+  @Prop({ default: 0 })
+  rescheduleAsks: number;              // 改期追问轮数:≥3轮还拿不到具体时间→转人工
+
+  @Prop({ default: 0 })
+  otherStreak: number;                 // 连续听不懂(OTHER)次数:≥2→转人工
+
+  @Prop()
+  pendingTime: string;                 // 候选人期望的改期时间(等HR拍板中)
+
   @Prop({ default: false, index: true })
   humanTakeover: boolean;              // 转人工：true=AI 不接待此对话，HR 真人跟进（表格【转人工】字段同步来）
 
