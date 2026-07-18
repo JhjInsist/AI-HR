@@ -54,6 +54,12 @@ button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)
   </div>
 
   <div class="card">
+    <h2>📚 知识库 <span class="tag">Claude 答疑依据</span></h2>
+    <div class="hint" style="margin:0 0 10px">把 QA/FAQ 粘进来（问答对或纯文本都行）。候选人提问时 Claude 只用这里的内容回答，没有的转人工、绝不编造。留空则用内置公司信息。</div>
+    <div class="row" style="grid-template-columns:1fr"><textarea id="KNOWLEDGE_BASE" style="min-height:180px" placeholder="例：&#10;Q：公司在哪办公？&#10;A：北京海淀东升大厦A座。&#10;Q：面试是什么形式？&#10;A：线上视频面试，到时发面试链接。"></textarea></div>
+  </div>
+
+  <div class="card">
     <h2>📨 触达 <span class="tag">加好友 + 话术 + 开关</span></h2>
     <div class="row"><label><b>运行模式</b>误操防线</label><div><select id="DRY_RUN"><option value="true">演练（不真发，只记日志）</option><option value="false">真跑（真加好友触达）</option></select></div></div>
     <div class="row"><label><b>面试链接</b>约上时间后发</label><input id="INTERVIEW_LINK" placeholder="https://..."/></div>
@@ -94,7 +100,7 @@ button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)
 <div class="bar"><div class="inner"><button type="button" onclick="save()">保存配置</button><span id="msg"></span></div></div>
 
 <script>
-var FIELDS=["AIHR_APP_TOKEN","AIHR_TABLE_ID","PROG_APP_TOKEN","PROG_TABLE_ID","INTENT_BOT_ID","CHAT_BOT_ID","MODEL","DRY_RUN","INTERVIEW_LINK","HELLO_MSG","POLL_INTERVAL_SEC","MIAOHUI_GROUP_TOKEN","MIAOHUI_CORP_ID","MIAOHUI_BOT_USERID","FEISHU_BOT_NAME","HR_EMAIL","HR_NOTIFY_CHAT"];
+var FIELDS=["AIHR_APP_TOKEN","AIHR_TABLE_ID","PROG_APP_TOKEN","PROG_TABLE_ID","INTENT_BOT_ID","CHAT_BOT_ID","MODEL","DRY_RUN","INTERVIEW_LINK","HELLO_MSG","POLL_INTERVAL_SEC","MIAOHUI_GROUP_TOKEN","MIAOHUI_CORP_ID","MIAOHUI_BOT_USERID","FEISHU_BOT_NAME","HR_EMAIL","HR_NOTIFY_CHAT","KNOWLEDGE_BASE"];
 function el(id){return document.getElementById(id)}
 function msg(t,cls){var m=el("msg");m.textContent=t;m.className=cls||""}
 function load(){

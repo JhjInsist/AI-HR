@@ -18,15 +18,13 @@ export interface LlmResponse { message: string; usage?: any; }
 /** 多 provider：bedrock(Claude) / OpenAI 兼容网关(gpt 等)，可按需扩展 */
 export type LlmProvider = 'bedrock' | 'anthropic' | 'openai' | 'deepseek' | 'doubao';
 
-/** 招聘助理知识库（公司事实，注入 system prompt，模型只据此答，不编造） */
-export const SYS_CHAT =
-  '你是句子互动的招聘助理，在企业微信上和候选人聊天。只用下面的事实回答，不知道就说"这个我帮你转人工确认"，绝不编造。\n' +
+/** 默认知识库（公司事实）。配置台 KNOWLEDGE_BASE 可覆盖为你自己的 QA/FAQ。 */
+export const KB_DEFAULT =
   '【公司】句子互动(JuziBot)，企业级AI公司，做能真正进入业务流程干活的AI员工。\n' +
   '【办公地点】北京海淀东升大厦A座。\n' +
   '【面试流程】一面(HR/用人部门)→二面→CEO终面→发offer→背景调查→入职。\n' +
   '【面试形式】线上视频面试，到时点面试链接进入。\n' +
-  '【薪资/具体待遇】面议，统一回"这个我帮你转人工确认"。\n' +
-  '要求：口语化、简短(1-2句)、礼貌热情，答完问题自然引导回约面试时间。直接输出要发给候选人的话，不要任何JSON、标签、前后缀。';
+  '【薪资/具体待遇】面议，统一回"这个我帮你转人工确认"。';
 
 /** 意图分类 system prompt（只输出标签） */
 const SYS_INTENT =
@@ -156,9 +154,14 @@ export class LlmService {
     }
   }
 
-  /** 结合公司知识库回答候选人问题 */
+  /** 结合知识库回答候选人问题（知识库可在配置台 KNOWLEDGE_BASE 配自己的 QA，留空用内置） */
   async answer(text: string): Promise<string> {
-    const r = await this.completion({ system: SYS_CHAT, messages: [{ role: 'user', content: text }], temperature: 0.3, maxTokens: 300 });
+    const kb = this.config.get('KNOWLEDGE_BASE') || KB_DEFAULT;
+    const system =
+      '你是句子互动的招聘助理，在企业微信上和候选人聊天。只用下面【知识库】里的内容回答，' +
+      '知识库里没有的就说"这个我帮你转人工确认"，绝不编造。\n【知识库】\n' + kb +
+      '\n要求：口语化、简短(1-2句)、礼貌热情，答完问题自然引导回约面试时间。直接输出要发给候选人的话，不要任何JSON、标签、前后缀。';
+    const r = await this.completion({ system, messages: [{ role: 'user', content: text }], temperature: 0.3, maxTokens: 300 });
     return r.message || '这个我帮您转人工确认一下哈~';
   }
 }
