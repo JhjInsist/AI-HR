@@ -135,15 +135,19 @@ export class ReachService {
   // ───────────────────────── ② 秒回回调分发 ─────────────────────────
   /** 统一回调入口。按 body 字段分发：friend/confirm、friend/send、sentResult。 */
   async handleCallback(body: any) {
-    const id = body?.messageId || body?.eventId || body?.msgId || body?.id;
+    // ⚠️ 秒回小组级回调字段都在 data 下：body = { code, data: {...} }（见 known-everything 回调文档）
+    const d = body?.data || body;
+    const id = d?.messageId || d?.requestId || body?.eventId;
     try {
-      // 发送结果回调：带 sentStatus
-      if (body?.sentStatus !== undefined) return await this.onSentResult(body, id);
-      // 加好友结果回调：带 code（code=1 失败）
-      if (body?.code !== undefined && (body?.phoneNum || body?.extraInfo)) return await this.onFriendSend(body, id);
-      // 好友通过回调：带 wxid + phoneNum
-      if (body?.wxid && body?.phoneNum) return await this.onFriendConfirm(body, id);
-      this.logger.log(`[mh回调] 未识别类型 keys=${Object.keys(body || {}).join(',')}`);
+      // 接收消息回调（候选人回复，data.isSelf + data.contactId）→ 由秒懂画布处理，触达服务忽略
+      if (d?.isSelf !== undefined && d?.contactId) return;
+      // 发送消息结果回调：带 sentStatus
+      if (d?.sentStatus !== undefined) return await this.onSentResult(d, id);
+      // 加好友任务结果回调：带 createTimestamp（区别于好友通过，两者都有 code+phoneNum+extraInfo）
+      if (d?.createTimestamp !== undefined && d?.code !== undefined) return await this.onFriendSend(d, id);
+      // 好友通过回调：带 wxid + phoneNum + externalUserId
+      if (d?.wxid && d?.phoneNum) return await this.onFriendConfirm(d, id);
+      this.logger.log(`[mh回调] 未识别类型 keys=${Object.keys(d || {}).join(',')}`);
     } catch (e: any) {
       this.logger.error(`[mh回调] 处理异常: ${e?.message}`);
     }
