@@ -156,8 +156,28 @@ export class LlmService {
   }
 
   /** 结合知识库回答候选人问题（知识库可在配置台 KNOWLEDGE_BASE 配自己的 QA，留空用内置） */
+  private kbCache = { text: '', at: 0 };
+
+  /** 知识库单一真源=飞书FAQ表(经表格服务 /kb,60s缓存);拉不到回退配置台/内置 */
+  private async loadKb(): Promise<string> {
+    if (this.kbCache.text && Date.now() - this.kbCache.at < 60_000) return this.kbCache.text;
+    const base = (this.config.get('TABLE_SERVICE_URL') || process.env.TABLE_SERVICE_URL || '').replace(/\/$/, '');
+    if (base) {
+      try {
+        const { data } = await axios.get(`${base}/kb`, { timeout: 8000 });
+        if (data?.ok && data?.kb) {
+          this.kbCache = { text: data.kb, at: Date.now() };
+          return data.kb;
+        }
+      } catch (e: any) {
+        this.logger.warn(`拉取飞书FAQ知识库失败,回退本地配置: ${e?.message}`);
+      }
+    }
+    return this.config.get('KNOWLEDGE_BASE') || KB_DEFAULT;
+  }
+
   async answer(text: string): Promise<string> {
-    const kb = this.config.get('KNOWLEDGE_BASE') || KB_DEFAULT;
+    const kb = await this.loadKb();
     const system =
       '你是句子互动的招聘助理，在企业微信上和候选人聊天。你的核心目标是和候选人约定面试时间。\n' +
       '回答优先用【知识库】；知识库没有的，用常识以招聘助理身份得体简短回答，不编造具体数字、不做任何承诺。\n' +
