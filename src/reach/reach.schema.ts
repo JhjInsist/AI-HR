@@ -65,6 +65,9 @@ export class ReachTask {
   @Prop()
   chatId: string;                      // 发消息寻址用
 
+  @Prop({ default: false, index: true })
+  humanTakeover: boolean;              // 转人工：true=AI 不接待此对话，HR 真人跟进（表格【转人工】字段同步来）
+
   @Prop()
   intent: string;                      // 候选人意图
 

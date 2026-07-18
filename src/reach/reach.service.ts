@@ -178,6 +178,22 @@ export class ReachService {
     return { ok: true, taskId, status: ReachStatus.ADDING };
   }
 
+  // ───────────────────────── ①.5 反向转人工开关（表格 → 触达）─────────────────────────
+  /** 表格服务同步进度表【转人工】字段 → 按 dataId 更新任务。
+   *  true=此后候选人消息 AI 一律不接待(onMessage 静默)，由 HR 真人跟进；false=恢复 AI 接待。 */
+  async setHandover(dataId: string, handover: boolean) {
+    if (!dataId) return { ok: false, msg: '缺 dataId' };
+    const task = await this.taskModel.findOne({ dataId }).sort({ createdAt: -1 }).exec();
+    if (!task) return { ok: false, msg: `未找到 dataId=${dataId} 的任务` };
+    if (task.humanTakeover === handover) return { ok: true, taskId: task.taskId, unchanged: true };
+    task.humanTakeover = handover;
+    await task.save();
+    await this.appendTimeline(task.taskId, handover ? 'HANDOVER_ON' : 'HANDOVER_OFF',
+      handover ? '表格勾选转人工：AI 停止接待，HR 真人跟进' : '表格取消转人工：恢复 AI 接待');
+    this.logger.log(`[转人工] ${task.name || task.phone} → ${handover ? '人工接管' : '恢复AI'}`);
+    return { ok: true, taskId: task.taskId, humanTakeover: handover };
+  }
+
   // ───────────────────────── ② 秒回回调分发 ─────────────────────────
   /** 统一回调入口。按 body 字段分发：friend/confirm、friend/send、sentResult。 */
   async handleCallback(body: any) {
@@ -222,6 +238,12 @@ export class ReachService {
       .sort({ createdAt: -1 }).exec();
     if (!task) { this.logger.log(`[消息] 未匹配触达任务 extId=${extId}`); return; }
     if (chatId && task.chatId !== chatId) { task.chatId = chatId; await task.save(); }
+    // 转人工中：AI 一律不接待，候选人消息由 HR 真人在企微跟进，只留痕
+    if (task.humanTakeover) {
+      this.logger.log(`[消息] ${task.name || task.phone} 已转人工，AI 不接待`);
+      await this.appendTimeline(task.taskId, 'MSG_SKIP_HANDOVER', '转人工中，候选人消息由真人处理');
+      return;
+    }
     // 好友通过后首条消息 → 发欢迎语（这条通常是加好友打招呼回执，不当作候选人意图）
     if (task.status === ReachStatus.CONFIRMED || task.status === ReachStatus.ADDING) {
       await this.sendWelcome(task);

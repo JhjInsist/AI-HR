@@ -5,6 +5,7 @@ import { ReachService, CreateReachDto } from './reach.service';
 /**
  * 触达编排入口。
  * - POST /reach          表格服务发起触达（建任务 + 秒回加好友）
+ * - POST /handover        表格服务同步【转人工】开关（AI 是否接待此对话）
  * - POST /mh/callback     秒回统一回调入口（先回 200 再异步分发，避免地址被禁）
  */
 @Controller()
@@ -15,6 +16,12 @@ export class ReachController {
   @Post('reach')
   async reach(@Body() body: CreateReachDto) {
     return this.reachSvc.createTask(body || ({} as CreateReachDto));
+  }
+
+  /** 反向转人工：表格服务同步进度表【转人工】开关（HR 手动勾选/取消）→ {dataId, handover} */
+  @Post('handover')
+  async handover(@Body() body: { dataId?: string; handover?: boolean }) {
+    return this.reachSvc.setHandover((body?.dataId || '').trim(), body?.handover === true);
   }
 
   /**
