@@ -10,7 +10,8 @@ state/
 # 密钥与环境（绝不提交）
 .env
 .env.*
-!.env.example          # 模板入库（不含密钥真值）
+# 模板入库（不含密钥真值），故取消忽略
+!.env.example
 .appsecret
 *.pem
 *.key
