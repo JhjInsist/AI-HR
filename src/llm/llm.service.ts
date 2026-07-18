@@ -15,8 +15,8 @@ export interface LlmRequest {
 }
 export interface LlmResponse { message: string; usage?: any; }
 
-/** 预留多 provider：当前实现 anthropic，其余可按需扩展 */
-export type LlmProvider = 'anthropic' | 'openai' | 'deepseek' | 'doubao';
+/** 多 provider：bedrock(Claude) / OpenAI 兼容网关(gpt 等)，可按需扩展 */
+export type LlmProvider = 'bedrock' | 'anthropic' | 'openai' | 'deepseek' | 'doubao';
 
 /** 招聘助理知识库（公司事实，注入 system prompt，模型只据此答，不编造） */
 export const SYS_CHAT =
@@ -73,7 +73,44 @@ export class LlmService {
    * provider 字段预留：未来可加原生 anthropic /v1/messages 等分支。
    */
   async completion(req: LlmRequest): Promise<LlmResponse> {
+    // provider=bedrock 走 Bedrock 通道(Claude)，否则走 OpenAI 兼容网关(gpt 等)
+    if (this.provider() === 'bedrock') return this.bedrockChat(req);
     return this.gatewayChat(req);
+  }
+
+  /**
+   * Bedrock 通道(Claude via AWS Bedrock)，抄 ai-service bedrock.service：
+   * POST ${endpoint}/bedrock/v2/chat/completions
+   * body {modelId, accessKeyId, accessKeySecret, region, requestBody:{anthropic_version, max_tokens, system, messages, temperature}}
+   * 响应取 content[].text。
+   */
+  private async bedrockChat(req: LlmRequest): Promise<LlmResponse> {
+    const accessKeyId = process.env.AWS_ACCESS_KEY_ID || this.config.get('AWS_ACCESS_KEY_ID');
+    const accessKeySecret = process.env.AWS_SECRET_ACCESS_KEY || this.config.get('AWS_SECRET_ACCESS_KEY');
+    const region = this.config.get('AWS_REGION') || process.env.AWS_REGION || 'us-east-1';
+    const modelId = this.config.get('LLM_MODEL') || process.env.ANTHROPIC_MODEL || 'us.anthropic.claude-sonnet-4-6';
+    const proxyEndpoint = process.env.LLM_PROXY_ENDPOINT || this.config.get('LLM_PROXY_ENDPOINT');
+    if (!proxyEndpoint) throw new Error('缺 LLM_PROXY_ENDPOINT');
+    if (!accessKeyId || !accessKeySecret) throw new Error('缺 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY');
+    const requestBody: any = {
+      anthropic_version: 'bedrock-2023-05-31',
+      max_tokens: req.maxTokens || 1024,
+      messages: req.messages.map((m) => ({ role: m.role, content: m.content })),
+      temperature: req.temperature ?? 0.3,
+    };
+    if (req.system) requestBody.system = req.system;
+    try {
+      const r = await this.getAxios().post(`${proxyEndpoint}/bedrock/v2/chat/completions`, {
+        modelId, accessKeyId, accessKeySecret, region, requestBody,
+      });
+      const body = r.data;
+      const message = (body?.content || []).find((c: any) => c.type === 'text')?.text || '';
+      return { message: (message || '').trim(), usage: body?.usage };
+    } catch (e: any) {
+      const detail = e?.response?.data ? JSON.stringify(e.response.data) : e?.message;
+      this.logger.error(`Bedrock 调用失败: ${detail}`);
+      throw new Error(`Bedrock 调用失败: ${detail}`);
+    }
   }
 
   /**
