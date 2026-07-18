@@ -342,7 +342,17 @@ export class ReachService {
     const key = `mh:confirm:${id || body.wxid || body.phoneNum}`;
     if (!(await this.lock(key))) return;
     const extraInfo = (body?.extraInfo || '').trim();
-    const task = extraInfo ? await this.taskModel.findOne({ taskId: extraInfo }).exec() : null;
+    let task = extraInfo ? await this.taskModel.findOne({ taskId: extraInfo }).exec() : null;
+    if (!task) {
+      // 二次触达老好友：好友关系是【旧任务】建立的，秒回回传的 extraInfo 是旧 taskId，
+      // 而旧任务已被"/reach 同号清旧任务"清掉 → 按 taskId 必然查不到。
+      // 用回调自带的 phoneNum 兜底匹配本系统该号的最新任务；手机号也没有任务才是真·非本系统。
+      const phone = (body?.phoneNum || '').toString().replace(/\D/g, '').slice(-11);
+      if (phone) {
+        task = await this.taskModel.findOne({ phone }).sort({ createdAt: -1 }).exec();
+        if (task) this.logger.log(`[friend/confirm] extraInfo=${extraInfo || '无'} 未命中(旧任务已清)，按手机号兜底命中 ${task.taskId}`);
+      }
+    }
     if (!task) {
       this.logger.log(`[friend/confirm] 非本系统触达（extraInfo=${extraInfo || '无'}），不触发约面 phone=${body.phoneNum}`);
       return;
