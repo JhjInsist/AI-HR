@@ -49,13 +49,14 @@ export class LogicController {
     private readonly reachSvc: ReachService,
   ) {}
 
-  /** 查约面信息：GET /logic/candidate-info?phone=  （画布好友通过后发欢迎语用）
-   *  → 返回 {found, name, position, interviewTime} */
+  /** 查约面信息：GET /logic/candidate-info?phone=[&externalId=wecomContactId]
+   *  （画布好友通过后发欢迎语用）→ 返回 {found, name, position, interviewTime, welcome}
+   *  welcome 是拼好的欢迎语文本，画布直接发即可；externalId 会被存为关联键供意图回报匹配。 */
   @Get('candidate-info')
-  async candidateInfo(@Query('phone') phone: string) {
+  async candidateInfo(@Query('phone') phone: string, @Query('externalId') externalId?: string) {
     const p = (phone || '').trim();
     if (!p) return { found: false, msg: '缺少 phone' };
-    return this.reachSvc.getCandidateInfo(p);
+    return this.reachSvc.getCandidateInfo(p, externalId);
   }
 
   /** 意图回报：POST /logic/report-intent  body {phone, intent, slots?}

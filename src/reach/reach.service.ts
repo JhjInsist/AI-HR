@@ -37,15 +37,26 @@ export function parseInterviewTime(raw?: string): number | null {
   // 纯数字：Unix 秒（10 位）或毫秒（13 位）时间戳
   if (/^\d{10}$/.test(s)) return parseInt(s, 10) * 1000;
   if (/^\d{13}$/.test(s)) return parseInt(s, 10);
-  // "YYYY-MM-DD HH:mm[:ss]"：转成 ISO（补 T）后按本地时区解析
+  // "YYYY-MM-DD HH:mm[:ss]"：按东八区解释墙上时间（服务器时区无关：当 UTC 算再减 8 小时）
   const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
   if (m) {
-    const t = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}`).getTime();
+    const t = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)) - 8 * 3600 * 1000;
     return isNaN(t) ? null : t;
   }
   // 其余交给 Date 兜底（ISO 带时区等）
   const t = new Date(s).getTime();
   return isNaN(t) ? null : t;
+}
+
+/** 约面时间友好展示（按东八区 YYYY-MM-DD HH:mm）；解析不了则原样返回 */
+export function formatInterviewTimeText(raw?: string): string {
+  const s = (raw || '').trim();
+  if (!s) return '（时间待定）';
+  const ms = parseInterviewTime(s);
+  if (ms == null) return s;
+  const d = new Date(ms + 8 * 3600 * 1000); // 手动偏移到 UTC+8，规避服务器时区
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
@@ -209,17 +220,30 @@ export class ReachService {
   }
 
   // ───────────────────────── ③ 画布 plugin：查约面信息 ─────────────────────────
-  /** 好友通过后画布发欢迎语用。返回 {name, position, interviewTime}。 */
-  async getCandidateInfo(phone: string): Promise<{ found: boolean; name?: string; position?: string; interviewTime?: string }> {
+  /**
+   * 好友通过后画布发欢迎语用。返回结构化字段 + 拼好的 welcome 文本（画布直接发，话术确定性）。
+   * externalId：画布传来的 wecomContactId/externalUserId，存入任务作关联键，供后续意图回报匹配。
+   */
+  async getCandidateInfo(phone: string, externalId?: string): Promise<{ found: boolean; name?: string; position?: string; interviewTime?: string; welcome?: string }> {
     const task = await this.taskModel.findOne({ phone: (phone || '').trim() }).sort({ createdAt: -1 }).exec();
     if (!task) return { found: false };
+    let dirty = false;
+    // 关联键：画布带来的 contactId 存下，后面 report-intent 按它匹配任务（秒回回调缺失时的兜底）
+    const ext = (externalId || '').trim();
+    if (ext && task.externalUserId !== ext) { task.externalUserId = ext; dirty = true; }
     // 命中即认为欢迎语链已触发，推进到 WELCOMED（幂等：仅从 CONFIRMED/ADDING 推进）
     if (task.status === ReachStatus.CONFIRMED || task.status === ReachStatus.ADDING) {
       task.status = ReachStatus.WELCOMED;
-      await task.save();
-      await this.appendTimeline(task.taskId, 'WELCOMED', '画布已取约面信息发欢迎语');
+      dirty = true;
+      await this.appendTimeline(task.taskId, 'WELCOMED', `画布取约面信息发欢迎语${ext ? ` contactId=${ext}` : ''}`);
     }
-    return { found: true, name: task.name, position: task.position, interviewTime: task.interviewTime };
+    if (dirty) await task.save();
+    const timeText = formatInterviewTimeText(task.interviewTime);
+    const pos = task.position || '相关';
+    const welcome = task.name
+      ? `${task.name}您好~ 我是句子互动招聘助理😊 您应聘的【${pos}】岗位，一面已初步为您安排在 ${timeText}。请问这个时间方便吗？方便的话回复「可以」确认即可；如需调整，直接回复您方便的时间就好~`
+      : `您好~ 我是句子互动招聘助理😊 您的一面已初步安排在 ${timeText}。请问这个时间方便吗？方便回复「可以」确认，需调整请回复您方便的时间~`;
+    return { found: true, name: task.name, position: task.position, interviewTime: task.interviewTime, welcome };
   }
 
   // ───────────────────────── ④ 画布 plugin：意图回报 ─────────────────────────
