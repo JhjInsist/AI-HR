@@ -77,6 +77,15 @@ export class ReachTask {
   @Prop()
   pendingTime: string;                 // 候选人期望的改期时间(等HR拍板中)
 
+  @Prop({ default: false })
+  rejectAsked: boolean;                // 拒绝挽留:第一次婉拒先问原因,再拒才转人工
+
+  @Prop({ default: 0 })
+  revisits: number;                    // 沉默/条件式改期的每日回访次数,≥3天→转人工
+
+  @Prop()
+  evalDoc: string;                     // 面评文档链接(建日程时放进日程描述给面试官)
+
   @Prop({ default: false, index: true })
   humanTakeover: boolean;              // 转人工：true=AI 不接待此对话，HR 真人跟进（表格【转人工】字段同步来）
 

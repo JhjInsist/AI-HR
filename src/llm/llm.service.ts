@@ -24,7 +24,7 @@ export const KB_DEFAULT =
   '【办公地点】北京海淀东升大厦A座。\n' +
   '【面试流程】一面(HR/用人部门)→二面→CEO终面→发offer→背景调查→入职。\n' +
   '【面试形式】线上视频面试，到时点面试链接进入。\n' +
-  '【薪资/具体待遇】面议，统一回"这个我帮你转人工确认"。';
+  '【薪资/具体待遇】面议：回"薪资是面议的，面试聊得好都好谈~具体到面试环节和面试官细聊哈"。';
 
 /** 意图分类 system prompt（只输出标签） */
 const SYS_INTENT =
@@ -32,6 +32,7 @@ const SYS_INTENT =
   '- 想面试/要面试/愿意面试/可以面试、给出或同意某个面试时间、明确说可以/没问题/确认 → TIME\n' +
   '- 想改约/换时间/那天不行 → RESCHEDULE\n' +
   '- 明确拒绝/不考虑/不来了/已入职别家 → REJECT\n' +
+  '- 要求人工/找真人/让HR或招聘同事直接联系 → HUMAN\n' +
   '- 问公司/岗位/薪资/流程/地点/面试形式等问题 → QUESTION\n' +
   '- 其他闲聊或无法判断 → OTHER';
 
@@ -146,7 +147,7 @@ export class LlmService {
     try {
       const r = await this.completion({ system: SYS_INTENT, messages: [{ role: 'user', content: text }], temperature: 0, maxTokens: 10 });
       const label = (r.message || 'OTHER').toUpperCase().replace(/[^A-Z]/g, '');
-      const known = ['TIME', 'RESCHEDULE', 'REJECT', 'QUESTION', 'OTHER'];
+      const known = ['TIME', 'RESCHEDULE', 'REJECT', 'HUMAN', 'QUESTION', 'OTHER'];
       return known.find((k) => label.includes(k)) || 'OTHER';
     } catch (e: any) {
       this.logger.warn(`意图分类失败，回退 OTHER: ${e?.message}`);
@@ -158,10 +159,12 @@ export class LlmService {
   async answer(text: string): Promise<string> {
     const kb = this.config.get('KNOWLEDGE_BASE') || KB_DEFAULT;
     const system =
-      '你是句子互动的招聘助理，在企业微信上和候选人聊天。只用下面【知识库】里的内容回答，' +
-      '知识库里没有的就说"这个我帮你转人工确认"，绝不编造。\n【知识库】\n' + kb +
-      '\n要求：口语化、简短(1-2句)、礼貌热情，答完问题自然引导回约面试时间。直接输出要发给候选人的话，不要任何JSON、标签、前后缀。';
+      '你是句子互动的招聘助理，在企业微信上和候选人聊天。你的核心目标是和候选人约定面试时间。\n' +
+      '回答优先用【知识库】；知识库没有的，用常识以招聘助理身份得体简短回答，不编造具体数字、不做任何承诺。\n' +
+      '只有涉及公司机密、需要公司层面承诺(如口头offer、入职条件)、或你确实没法得体回答时，才说"这个我帮您问下同事再回复您"。\n' +
+      '【知识库】\n' + kb +
+      '\n要求：口语化、简短(1-2句)、礼貌热情。若候选人还没确认面试时间，答完必须自然把话题拉回确认面试时间。直接输出要发给候选人的话，不要任何JSON、标签、前后缀。';
     const r = await this.completion({ system, messages: [{ role: 'user', content: text }], temperature: 0.3, maxTokens: 300 });
-    return r.message || '这个我帮您转人工确认一下哈~';
+    return r.message || '这个我帮您问下同事再回复您哈~';
   }
 }

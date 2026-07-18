@@ -123,12 +123,21 @@ export class FeishuService {
   }): Promise<{ eventId: string; meetingUrl: string }> {
     const calendarId = await this.appPrimaryCalendarId();
     const cal = encodeURIComponent(calendarId);
+    // 面试官 open_id:设为会议主持人——自动录制/妙记纪要归主持人,面试官才拿得到文字稿(玄玄核心诉求)
+    const hostOpenId = opts.hrOpenId || (opts.hrEmail ? await this.openIdByEmail(opts.hrEmail) : '');
     const created = await this.req('POST', `/open-apis/calendar/v4/calendars/${cal}/events`, {
       summary: opts.summary,
       description: opts.description || '',
       start_time: { timestamp: String(Math.floor(opts.startTime / 1000)), timezone: 'Asia/Shanghai' },
       end_time: { timestamp: String(Math.floor(opts.endTime / 1000)), timezone: 'Asia/Shanghai' },
-      vchat: { vc_type: 'vc', meeting_settings: { allow_attendees_start: true } },
+      vchat: {
+        vc_type: 'vc',
+        meeting_settings: {
+          allow_attendees_start: true,
+          auto_record: true,
+          ...(hostOpenId ? { owner_id: hostOpenId, assign_hosts: [hostOpenId] } : {}),
+        },
+      },
       attendee_ability: 'can_see_others',
       need_notification: true,
       reminders: [{ minutes: 15 }],
@@ -138,7 +147,7 @@ export class FeishuService {
 
     // 邀请 HR：优先用传入 open_id，其次用邮箱换 open_id，再不行用外部邮箱参会人
     if ((opts.hrOpenId || opts.hrEmail) && eventId) {
-      const openId = opts.hrOpenId || (opts.hrEmail ? await this.openIdByEmail(opts.hrEmail) : '');
+      const openId = hostOpenId;
       const attendee = openId
         ? { type: 'user', user_id: openId }
         : { type: 'third_party', third_party_email: opts.hrEmail };
