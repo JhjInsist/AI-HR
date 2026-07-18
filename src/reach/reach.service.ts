@@ -232,7 +232,7 @@ export class ReachService {
 
   /** 好友通过后发带时间欢迎语（用 task.chatId 经秒回 /message/send 发） */
   private async sendWelcome(task: ReachTaskDocument) {
-    const welcome = buildOpening(task.name, task.position, this.config.get('OPENING_TEMPLATE'));
+    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'));
     if (task.chatId) {
       const r = await this.miaohui.sendText(task.chatId, welcome);
       this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code}`);
@@ -255,8 +255,7 @@ export class ReachService {
         status = ReachStatus.INTENT_ACCEPT;
         if (!meetingLink) meetingLink = await this.scheduleInterview(task, given ? { time: given } : {});
         const timeText = given || formatInterviewTimeText(task.interviewTime);
-        reply = buildInviteMessage(task.name, task.position, given || task.interviewTime, this.config.get('WELCOME_TEMPLATE'));
-        if (meetingLink) reply += `\n会议链接：${meetingLink}`;
+        reply = `好的，面试就约在【${timeText}】啦~ 线上视频形式${meetingLink ? `，会议链接：${meetingLink}` : '，会议链接稍后发您'}。到时见~`;
         note = `候选人确认面试时间【${timeText}】`;
         break;
       }
