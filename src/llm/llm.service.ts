@@ -123,12 +123,14 @@ export class LlmService {
     const model = this.config.get('LLM_MODEL') || process.env.ANTHROPIC_MODEL || 'us.anthropic.claude-sonnet-4-6';
     const proxyEndpoint = process.env.LLM_PROXY_ENDPOINT || this.config.get('LLM_PROXY_ENDPOINT');
     const baseUrl = proxyEndpoint || 'https://api.openai.com';
+    // 网关地址若已是完整 chat/completions 路径(如火山方舟 /api/v3/chat/completions)直接用,否则按 OpenAI 习惯拼 /v1
+    const chatUrl = baseUrl.includes('/chat/completions') ? baseUrl : `${baseUrl}/v1/chat/completions`;
     const messages: any[] = [];
     if (req.system) messages.push({ role: 'system', content: req.system });
     messages.push(...req.messages.map((m) => ({ role: m.role, content: m.content })));
     const data: any = { model, messages, max_tokens: req.maxTokens || 1024, temperature: req.temperature ?? 0.3 };
     try {
-      const r = await this.getAxios().post(`${baseUrl}/v1/chat/completions`, data, {
+      const r = await this.getAxios().post(chatUrl, data, {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
       });
       const message = r.data?.choices?.[0]?.message?.content || '';
