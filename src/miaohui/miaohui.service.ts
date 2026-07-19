@@ -28,7 +28,7 @@ export class MiaohuiService {
         token,
         phoneNum: phone,
         helloMsg,
-        userId: opts?.userId || this.config.get('MIAOHUI_BOT_USERID', 'jiahongjia'),
+        userId: opts?.userId || '', // 托管号由调用方(按HR名录)传入,不再用全局默认
         corpId: this.config.get('MIAOHUI_CORP_ID', 'ww5ecc1acd5dce6e9d'),
         instant: true,
         isEncrypt: false,

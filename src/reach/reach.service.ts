@@ -197,15 +197,12 @@ export class ReachService {
     if (removed.deletedCount) this.logger.log(`[触达] ${contact} 清理旧任务 ${removed.deletedCount} 条后重新触达`);
 
     const taskId = `RT${Date.now()}${Math.floor(Math.random() * 1000)}`;
-    // 加好友托管号：优先按面试官从 HR 名录取该 HR 的 userId(秒回 botId)；名录无此人或没配 userId 时回退全局默认。
-    let hrBotUserId = this.config.get('MIAOHUI_BOT_USERID', 'jiahongjia');
+    // 加好友托管号：只从 HR 名录按面试官取 userId(秒回 botId)。名录没有该面试官则自动新增一条(供中台补配)，不再用全局默认。
     const _interviewer = (dto.interviewer || '').trim();
+    let hrBotUserId = '';
     if (_interviewer) {
-      const _hr = await this.hr.findByName(_interviewer);
-      if (_hr?.userId) {
-        hrBotUserId = _hr.userId;
-        this.logger.log(`[触达] 面试官「${_interviewer}」按名录用托管号 ${hrBotUserId}`);
-      }
+      const _hr = await this.hr.findOrCreate(_interviewer);
+      hrBotUserId = (_hr.userId || '').trim();
     }
     const doc = await this.taskModel.create({
       taskId,
@@ -221,6 +218,18 @@ export class ReachService {
       status: ReachStatus.ADDING,
       timeline: [{ at: new Date(), event: 'CREATE', detail: `建任务(${dto.round || '一面'})，联系方式=${wxid ? '微信号' : '手机号'}，约面时间=${dto.interviewTime || '未填'}` }],
     });
+
+    // 托管号未配置(面试官不在名录/名录没填 botId)：不再用全局默认，直接失败并提示去中台配置(名录已自动新增该面试官)。
+    if (!hrBotUserId) {
+      const who = _interviewer || '未指定面试官';
+      doc.status = ReachStatus.ADD_FAILED;
+      await doc.save();
+      await this.appendTimeline(taskId, 'ADD_FAILED', `面试官「${who}」未配置秒回托管号(botId)`);
+      await this.requestHandover(doc, 'SEND_FAILED', `面试官「${who}」在 HR 名录里没配秒回托管号(botId)，已自动加进名录，请去中台 HR 名录补上 botId 后重试`);
+      await this.backfillProgress(doc, `触达失败：面试官「${who}」未配置秒回托管号`, 'ADD_FAILED');
+      this.logger.warn(`[触达] ${contact} 面试官「${who}」无秒回托管号，已建名录待配，不发起加好友`);
+      return { ok: false, taskId, msg: '面试官未配置秒回托管号(botId)，请在中台 HR 名录配置', needConfig: true };
+    }
 
     // 打招呼(加好友申请语)只做简单自我介绍；欢迎语(带约面时间+请确认)在好友通过后单独发
     const hello = this.config.get('HELLO_MSG', '你好，我是句子互动招聘助理，看到你投递的简历，想加你了解一下~');

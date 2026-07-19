@@ -41,4 +41,15 @@ export class HrService {
   findByName(name: string): Promise<HrMappingDocument | null> {
     return this.model.findOne({ name: (name || '').trim() }).exec();
   }
+
+  /** 按姓名查，名录没有则自动新增一条空记录（供中台补 userId/邮箱），返回文档。 */
+  async findOrCreate(name: string): Promise<HrMappingDocument> {
+    const n = (name || '').trim();
+    let doc = await this.model.findOne({ name: n }).exec();
+    if (!doc) {
+      doc = await this.model.create({ name: n });
+      this.logger.log(`HR 名录自动新增面试官: ${n}（待在中台配置秒回托管号 botId / 邮箱）`);
+    }
+    return doc;
+  }
 }
