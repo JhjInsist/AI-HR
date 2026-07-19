@@ -123,7 +123,10 @@ export class FeishuService {
   }): Promise<{ eventId: string; meetingUrl: string }> {
     const calendarId = await this.appPrimaryCalendarId();
     const cal = encodeURIComponent(calendarId);
-    // 面试官 open_id:设为会议主持人——自动录制/妙记纪要归主持人,面试官才拿得到文字稿(玄玄核心诉求)
+    // 面试官 open_id（用于加为参会人）。
+    // ⚠️ 组织者是应用（tenant 身份建日程），飞书禁止机器人组织者设 assign_hosts/owner_id
+    //（否则报 400 "organizer is bot, can not set assign_hosts"）。故不指定主持人，
+    // 靠 allow_attendees_start=true 让面试官(参会人)也能开会，auto_record 保留自动录制。
     const hostOpenId = opts.hrOpenId || (opts.hrEmail ? await this.openIdByEmail(opts.hrEmail) : '');
     const created = await this.req('POST', `/open-apis/calendar/v4/calendars/${cal}/events`, {
       summary: opts.summary,
@@ -135,7 +138,6 @@ export class FeishuService {
         meeting_settings: {
           allow_attendees_start: true,
           auto_record: true,
-          ...(hostOpenId ? { owner_id: hostOpenId, assign_hosts: [hostOpenId] } : {}),
         },
       },
       attendee_ability: 'can_see_others',
