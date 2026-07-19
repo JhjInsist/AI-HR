@@ -27,9 +27,9 @@ export class MiaohuiService {
       const body: Record<string, any> = {
         token,
         phoneNum: phone,
+        // 新版秒回(Stride)托管账号字段是 botId（老版叫 userId）；值由调用方按 HR 名录传入。
+        botId: opts?.userId || '',
         helloMsg,
-        userId: opts?.userId || '', // 托管号由调用方(按HR名录)传入,不再用全局默认
-        corpId: this.config.get('MIAOHUI_CORP_ID', 'ww5ecc1acd5dce6e9d'),
         instant: true,
         isEncrypt: false,
       };
