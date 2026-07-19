@@ -485,7 +485,11 @@ export class ReachService {
     if (status === ReachStatus.INTENT_ACCEPT) {
       await this.notifyHr(`✅【候选人确认】${who} 确认面试${given ? `：${given}` : ''}${meetingLink ? `\n会议链接：${meetingLink}` : ''}`);
     } else if (status === ReachStatus.INTENT_RESCHEDULE) {
-      await this.requestHandover(task, 'RESCHEDULE', '候选人想改约，需HR协调新时间', text);
+      // 改期不转人工(玄玄规格):AI已回复"跟面试官确认",通过回填把 expectTime 带给表格服务→@一面面试官拍板;
+      // 面试官改一面时间即拍板,表格服务调 /notify → notifyTimeChange 自动通知候选人新时间。
+      if (expectTime) {
+        await this.notifyHr(`🔄【候选人要改期】${who} 希望调整到【${expectTime}】，请一面面试官在进度表改「一面时间」拍板，确认后会自动通知候选人。`);
+      }
     } else if (status === ReachStatus.INTENT_REJECT) {
       await this.requestHandover(task, 'REJECT', '候选人婉拒本次面试', text);
     } else if (intent === 'QUESTION' && /问下同事|问一下同事/.test(reply)) {
