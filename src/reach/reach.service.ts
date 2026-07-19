@@ -304,22 +304,25 @@ export class ReachService {
     }
     const id = d?.messageId || d?.requestId || body?.eventId;
     // 【观测】识别推送类型（与下方分发判据一致），便于确认分类是否正确
+    // 加好友结果回调:code 在顶层 body.code(非 data 内),data 里带 errorCode/message,标识用 errorCode 或 fromwxid。
+    // 好友通过回调:data 带 externalUserId + wxid。两者都有 createTimestamp/phoneNum,靠 errorCode/externalUserId 区分。
+    const isFriendSend = (d?.errorCode !== undefined) || (body?.code !== undefined && d?.fromwxid !== undefined && d?.externalUserId === undefined && d?.contactId === undefined);
     let type = 'UNKNOWN(未识别)';
     if (d?.isSelf !== undefined && d?.contactId) type = 'MESSAGE(收到消息)';
     else if (d?.sentStatus !== undefined) type = 'SENT_RESULT(发送结果)';
-    else if (d?.createTimestamp !== undefined && d?.code !== undefined) type = 'FRIEND_SEND(加好友结果)';
-    else if (d?.wxid && d?.phoneNum) type = 'FRIEND_CONFIRM(好友通过)';
+    else if (d?.externalUserId && d?.wxid && d?.phoneNum) type = 'FRIEND_CONFIRM(好友通过)';
+    else if (isFriendSend) type = 'FRIEND_SEND(加好友结果)';
     this.logger.log(`[mh回调·识别] 类型=${type} isSelf=${d?.isSelf} contactType=${d?.contactType} msgType=${d?.messageType ?? d?.type} contactId=${d?.contactId || ''} wxid=${d?.wxid || ''} chatId=${d?.chatId || ''} msgId=${d?.messageId || ''} 文本=${JSON.stringify(this.extractMsgText(d)).slice(0, 60)}`);
     try {
       // 接收消息回调（候选人回复，data.isSelf + data.contactId）→ 服务主导对话（已弃用秒懂画布）
       if (d?.isSelf !== undefined && d?.contactId) return await this.onMessage(d, id);
       // 发送消息结果回调：带 sentStatus
       if (d?.sentStatus !== undefined) return await this.onSentResult(d, id);
-      // 加好友任务结果回调：带 createTimestamp（区别于好友通过，两者都有 code+phoneNum+extraInfo）
-      if (d?.createTimestamp !== undefined && d?.code !== undefined) return await this.onFriendSend(d, id);
-      // 好友通过回调：带 wxid + phoneNum + externalUserId
-      if (d?.wxid && d?.phoneNum) return await this.onFriendConfirm(d, id);
-      this.logger.log(`[mh回调] 未识别类型 keys=${Object.keys(d || {}).join(',')}`);
+      // 好友通过回调：data 带 externalUserId + wxid + phoneNum（先于加好友结果判断，避免误分）
+      if (d?.externalUserId && d?.wxid && d?.phoneNum) return await this.onFriendConfirm(d, id);
+      // 加好友结果回调：code 在顶层 body.code，data 带 errorCode/message；把顶层 code 并进 d 传给处理器
+      if (isFriendSend) return await this.onFriendSend({ ...d, code: body?.code ?? d?.code }, id);
+      this.logger.log(`[mh回调] 未识别类型 keys=${Object.keys(d || {}).join(',')} bodyCode=${body?.code}`);
     } catch (e: any) {
       this.logger.error(`[mh回调] 处理异常: ${e?.message}`);
     }
