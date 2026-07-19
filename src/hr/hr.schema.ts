@@ -20,6 +20,9 @@ export class HrMapping {
 
   @Prop({ default: '' })
   note: string; // 备注（岗位/团队等，仅展示）
+
+  @Prop({ default: '' })
+  userId: string; // 秒回托管账号 botId（该 HR 的招聘企微号，加好友时用；由中台 HR 名录维护）
 }
 
 export const HrMappingSchema = SchemaFactory.createForClass(HrMapping);

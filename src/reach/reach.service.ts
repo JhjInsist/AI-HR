@@ -197,7 +197,16 @@ export class ReachService {
     if (removed.deletedCount) this.logger.log(`[触达] ${contact} 清理旧任务 ${removed.deletedCount} 条后重新触达`);
 
     const taskId = `RT${Date.now()}${Math.floor(Math.random() * 1000)}`;
-    const hrBotUserId = this.config.get('MIAOHUI_BOT_USERID', 'jiahongjia');
+    // 加好友托管号：优先按面试官从 HR 名录取该 HR 的 userId(秒回 botId)；名录无此人或没配 userId 时回退全局默认。
+    let hrBotUserId = this.config.get('MIAOHUI_BOT_USERID', 'jiahongjia');
+    const _interviewer = (dto.interviewer || '').trim();
+    if (_interviewer) {
+      const _hr = await this.hr.findByName(_interviewer);
+      if (_hr?.userId) {
+        hrBotUserId = _hr.userId;
+        this.logger.log(`[触达] 面试官「${_interviewer}」按名录用托管号 ${hrBotUserId}`);
+      }
+    }
     const doc = await this.taskModel.create({
       taskId,
       dataId: dto.dataId || '',
