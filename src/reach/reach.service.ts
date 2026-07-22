@@ -333,8 +333,15 @@ export class ReachService {
    * 候选人消息回调入口（服务主导，已弃用秒懂画布）。
    * 好友通过后首条消息 → 发带时间欢迎语；之后的回复 → 大模型意图分类 → 回复+建日程+通知HR+回填。
    */
+  /** 是否在工作时间(北京时 9:00-22:00);外面不触答/不聊天(玄玄需求:别半夜骚扰候选人)。 */
+  private inWorkHours(): boolean {
+    const h = new Date(Date.now() + 8 * 3600 * 1000).getUTCHours();
+    return h >= 9 && h < 22;
+  }
+
   private async onMessage(d: any, id?: string) {
     if (d?.isSelf === true) return; // 自己发的消息忽略
+    if (!this.inWorkHours()) { this.logger.log('[工作时间外] 不聊天,消息暂不处理'); return; }
     const chatId = (d?.chatId || '').toString();
     const extId = (d?.externalUserId || d?.contactId || '').toString().trim();
     if (!extId) return;
@@ -377,8 +384,21 @@ export class ReachService {
   }
 
   /** 候选人回复 → 大模型意图分类 → 回复 + 建日程 + 通知HR + 回填 */
+  /** 确定性意图前置:明确的用规则直判(不靠模型瞎猜),模糊的才交给大模型。修"已读乱回"。 */
+  private quickIntent(text: string): string | null {
+    const t = (text || '').trim();
+    if (!t) return null;
+    if (/转人工|找真人|人工客服|要真人|真人.*聊/.test(t)) return 'HUMAN';
+    if (/不考虑|不来了|不面了|不去了|已入职|入职了|找到工作|算了不|放弃/.test(t)) return 'REJECT';
+    const slot = extractTimeSlot(t);
+    if (slot.date || slot.clock) return 'TIME';                 // 带具体时间→TIME,由 sameAsScheduled 分确认/改期
+    if (/^(可以|好的|好呀|好嘞|没问题|行|行的|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)/i.test(t)) return 'TIME';
+    if (/不行|不方便|改期|改一下|改个时间|换时间|换个时间|调整.*时间|另约|时间.*不(合适|行)/.test(t)) return 'RESCHEDULE';
+    return null;
+  }
+
   private async handleReply(task: ReachTaskDocument, text: string) {
-    const intent = await this.llm.classifyIntent(text);
+    const intent = this.quickIntent(text) || await this.llm.classifyIntent(text);
     const given = extractTime(text);
     const slot = extractTimeSlot(text);
     let reply = ''; let status: ReachStatus = ReachStatus.REPLIED; let note = '';
