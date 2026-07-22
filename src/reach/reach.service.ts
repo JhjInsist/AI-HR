@@ -262,6 +262,14 @@ export class ReachService {
     task.interviewTime = interviewTime;
     task.round = rd;
     task.status = ReachStatus.WELCOMED;  // 回到"已发邀约待确认"态,候选人回复走原意图链
+    // 已建过日程的:同步移动日历日程到新时间(玄玄需求:面试官同意后同步更新日历日程)
+    if (task.scheduleEventId) {
+      const start = parseInterviewTime(interviewTime);
+      if (start != null) {
+        const moved = await this.feishu.updateInterviewEventTime(task.scheduleEventId, start, start + 30 * 60 * 1000);
+        await this.appendTimeline(task.taskId, moved ? 'SCHEDULE_MOVED' : 'SCHEDULE_MOVE_FAIL', `日程改到 ${timeText}`);
+      }
+    }
     await task.save();
     await this.appendTimeline(task.taskId, 'RESCHEDULE_NOTIFY', `已推送${rd}改期:${timeText}`);
     this.logger.log(`[改期直推] ${task.name || task.phone} ${rd}→${timeText}`);
