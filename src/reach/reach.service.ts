@@ -262,6 +262,14 @@ export class ReachService {
     task.interviewTime = interviewTime;
     task.round = rd;
     task.status = ReachStatus.WELCOMED;  // 回到"已发邀约待确认"态,候选人回复走原意图链
+    // 已建过日程的:同步移动日历日程到新时间(玄玄需求:面试官同意后同步更新日历日程)
+    if (task.scheduleEventId) {
+      const start = parseInterviewTime(interviewTime);
+      if (start != null) {
+        const moved = await this.feishu.updateInterviewEventTime(task.scheduleEventId, start, start + 30 * 60 * 1000);
+        await this.appendTimeline(task.taskId, moved ? 'SCHEDULE_MOVED' : 'SCHEDULE_MOVE_FAIL', `日程改到 ${timeText}`);
+      }
+    }
     await task.save();
     await this.appendTimeline(task.taskId, 'RESCHEDULE_NOTIFY', `已推送${rd}改期:${timeText}`);
     this.logger.log(`[改期直推] ${task.name || task.phone} ${rd}→${timeText}`);
@@ -333,8 +341,15 @@ export class ReachService {
    * 候选人消息回调入口（服务主导，已弃用秒懂画布）。
    * 好友通过后首条消息 → 发带时间欢迎语；之后的回复 → 大模型意图分类 → 回复+建日程+通知HR+回填。
    */
+  /** 是否在工作时间(北京时 9:00-22:00);外面不触答/不聊天(玄玄需求:别半夜骚扰候选人)。 */
+  private inWorkHours(): boolean {
+    const h = new Date(Date.now() + 8 * 3600 * 1000).getUTCHours();
+    return h >= 9 && h < 22;
+  }
+
   private async onMessage(d: any, id?: string) {
     if (d?.isSelf === true) return; // 自己发的消息忽略
+    if (!this.inWorkHours()) { this.logger.log('[工作时间外] 不聊天,消息暂不处理'); return; }
     const chatId = (d?.chatId || '').toString();
     const extId = (d?.externalUserId || d?.contactId || '').toString().trim();
     if (!extId) return;
@@ -360,23 +375,38 @@ export class ReachService {
     await this.handleReply(task, text);
   }
 
-  /** 好友通过后发带时间欢迎语（用 task.chatId 经秒回 /message/send 发） */
+  /** 发带时间欢迎语（秒回 /message/send）。幂等:已发过直接返回;发送成功才推进 WELCOMED,
+   *  失败保持原状态,候选人开口后 onMessage 兜底补发。会话标识优先 chatId,回退 externalUserId/wxid。 */
   private async sendWelcome(task: ReachTaskDocument) {
+    if (task.status === ReachStatus.WELCOMED || task.status === ReachStatus.REPLIED
+        || task.status === ReachStatus.INTENT_ACCEPT) return; // 已进入后续阶段,不重复打招呼
+    const target = task.chatId || task.externalUserId || task.wxid;
+    if (!target) { this.logger.warn(`[欢迎语] task ${task.taskId} 无会话标识,等候选人开口再发`); return; }
     const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'), (task as any).round);
-    if (task.chatId) {
-      const r = await this.miaohui.sendText(task.chatId, welcome);
-      this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code}`);
-    } else {
-      this.logger.warn(`[欢迎语] task ${task.taskId} 无 chatId，跳过`);
-    }
+    const r = await this.miaohui.sendText(target, welcome);
+    this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code} via=${task.chatId ? 'chatId' : 'extId'}`);
+    if (!r.ok) return; // 没发出去,保持 CONFIRMED,等 onMessage 兜底
     task.status = ReachStatus.WELCOMED;
     await task.save();
     await this.appendTimeline(task.taskId, 'WELCOMED', '已发带时间欢迎语');
   }
 
   /** 候选人回复 → 大模型意图分类 → 回复 + 建日程 + 通知HR + 回填 */
+  /** 确定性意图前置:明确的用规则直判(不靠模型瞎猜),模糊的才交给大模型。修"已读乱回"。 */
+  private quickIntent(text: string): string | null {
+    const t = (text || '').trim();
+    if (!t) return null;
+    if (/转人工|找真人|人工客服|要真人|真人.*聊/.test(t)) return 'HUMAN';
+    if (/不考虑|不来了|不面了|不去了|已入职|入职了|找到工作|算了不|放弃/.test(t)) return 'REJECT';
+    const slot = extractTimeSlot(t);
+    if (slot.date || slot.clock) return 'TIME';                 // 带具体时间→TIME,由 sameAsScheduled 分确认/改期
+    if (/^(可以|好的|好呀|好嘞|没问题|行|行的|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)/i.test(t)) return 'TIME';
+    if (/不行|不方便|改期|改一下|改个时间|换时间|换个时间|调整.*时间|另约|时间.*不(合适|行)/.test(t)) return 'RESCHEDULE';
+    return null;
+  }
+
   private async handleReply(task: ReachTaskDocument, text: string) {
-    const intent = await this.llm.classifyIntent(text);
+    const intent = this.quickIntent(text) || await this.llm.classifyIntent(text);
     const given = extractTime(text);
     const slot = extractTimeSlot(text);
     let reply = ''; let status: ReachStatus = ReachStatus.REPLIED; let note = '';
@@ -404,6 +434,12 @@ export class ReachService {
             note = `候选人想改期(还没给到具体哪天:${text.slice(0, 20)})，AI引导区间中(第${task.rescheduleAsks}轮)`;
           }
           break;
+        }
+        // 已约成后候选人重复确认:不重复建日程/不重复通知,只回一句(玄玄:约成只通知一次)
+        if (task.status === ReachStatus.INTENT_ACCEPT && task.meetingLink) {
+          if (task.chatId) await this.miaohui.sendText(task.chatId,
+            `您的面试已经约好啦，${formatInterviewTimeText(task.interviewTime)}，到时见~`);
+          return;
         }
         status = ReachStatus.INTENT_ACCEPT;
         task.rescheduleAsks = 0; task.pendingTime = '';
@@ -482,9 +518,8 @@ export class ReachService {
     await this.appendTimeline(task.taskId, `INTENT_${intent}`, given || '');
     const who = task.name || task.phone;
     // 确认→通知HR；改约/拒绝/知识库答不上→转人工（表格服务置「转人工=是」+通知HR）
-    if (status === ReachStatus.INTENT_ACCEPT) {
-      await this.notifyHr(`✅【候选人确认】${who} 确认面试${given ? `：${given}` : ''}${meetingLink ? `\n会议链接：${meetingLink}` : ''}`);
-    } else if (status === ReachStatus.INTENT_RESCHEDULE) {
+    // 约成通知统一由表格服务侧「一面约成」发(含@面试官+勾一面+会议链接),这里不重复发(玄玄:只通知一次)
+    if (status === ReachStatus.INTENT_RESCHEDULE) {
       // 改期不转人工(玄玄规格):AI已回复"跟面试官确认",通过回填把 expectTime 带给表格服务→@一面面试官拍板;
       // 面试官改一面时间即拍板,表格服务调 /notify → notifyTimeChange 自动通知候选人新时间。
       if (expectTime) {
@@ -534,9 +569,13 @@ export class ReachService {
     task.status = ReachStatus.CONFIRMED;
     task.wxid = body.wxid || task.wxid;
     task.externalUserId = body.externalUserId || body.externalUserid || task.externalUserId;
+    if (body.chatId) task.chatId = body.chatId;
     await task.save();
     await this.appendTimeline(task.taskId, 'CONFIRMED', `好友通过 wxid=${task.wxid} extId=${task.externalUserId || '无'}`);
     this.logger.log(`[friend/confirm] ${task.name || task.phone} 好友已通过 extId=${task.externalUserId || '无'}`);
+    // 好友通过即主动发首条邀约,不等候选人先开口(玄玄需求)。发不出去(还没会话标识)时保持
+    // CONFIRMED,候选人开口后 onMessage 会兜底补发。
+    await this.sendWelcome(task);
   }
 
   /** 加好友结果：code=1 失败 → ADD_FAILED + 通知HR */
@@ -655,7 +694,7 @@ export class ReachService {
       await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', `未匹配到 HR（面试官=${interviewer || '未知'}）`);
       return '';
     }
-    const end = start + 60 * 60 * 1000; // 结束=开始+1小时
+    const end = start + 30 * 60 * 1000; // 结束=开始+30分钟(玄玄:面试统一30min)
     try {
       const { eventId, meetingUrl } = await this.feishu.createInterviewEvent({
         hrEmail,
@@ -663,7 +702,7 @@ export class ReachService {
         summary: `线上面试-${task.position || '岗位待定'}-${task.name || task.phone}`,
         startTime: start,
         endTime: end,
-        description: `候选人：${task.name || ''}（${task.phone}）\n岗位：${task.position || ''}\n面试官：${interviewer || '（未指定）'}${task.evalDoc ? `\n面评：${task.evalDoc}` : ''}`,
+        description: `候选人：${task.name || ''}（${task.phone}）\n岗位：${task.position || ''}\n面试官：${interviewer || '（未指定）'}`,
       });
       task.meetingLink = meetingUrl || '';
       task.scheduleEventId = eventId || '';

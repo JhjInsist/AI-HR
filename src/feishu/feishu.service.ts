@@ -174,6 +174,25 @@ export class FeishuService {
     return { eventId, meetingUrl };
   }
 
+  /** 改期时同步移动已建的面试日程（PATCH 起止时间，会议链接/参会人/录制设置保持不变）。
+   *  startTime/endTime 为 Unix 毫秒。成功返回 true；失败(如日程已被删)不抛，返回 false 由调用方兜底。 */
+  async updateInterviewEventTime(eventId: string, startTime: number, endTime: number): Promise<boolean> {
+    if (!eventId) return false;
+    try {
+      const calendarId = await this.appPrimaryCalendarId();
+      const cal = encodeURIComponent(calendarId);
+      await this.req('PATCH', `/open-apis/calendar/v4/calendars/${cal}/events/${eventId}`, {
+        start_time: { timestamp: String(Math.floor(startTime / 1000)), timezone: 'Asia/Shanghai' },
+        end_time: { timestamp: String(Math.floor(endTime / 1000)), timezone: 'Asia/Shanghai' },
+        need_notification: true,
+      });
+      return true;
+    } catch (e: any) {
+      this.logger.warn(`[改期]更新日程失败 event=${eventId}: ${e?.message}`);
+      return false;
+    }
+  }
+
   /** 下载某记录某附件字段的文件到本地目录，返回文件路径数组 */
   async downloadAttachments(appToken: string, tableId: string, recordId: string, field: string, dir: string): Promise<string[]> {
     // 附件 file_token 在记录字段里；下载走 drive media
