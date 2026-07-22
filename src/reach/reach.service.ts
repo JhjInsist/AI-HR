@@ -360,15 +360,17 @@ export class ReachService {
     await this.handleReply(task, text);
   }
 
-  /** 好友通过后发带时间欢迎语（用 task.chatId 经秒回 /message/send 发） */
+  /** 发带时间欢迎语（秒回 /message/send）。幂等:已发过直接返回;发送成功才推进 WELCOMED,
+   *  失败保持原状态,候选人开口后 onMessage 兜底补发。会话标识优先 chatId,回退 externalUserId/wxid。 */
   private async sendWelcome(task: ReachTaskDocument) {
+    if (task.status === ReachStatus.WELCOMED || task.status === ReachStatus.REPLIED
+        || task.status === ReachStatus.INTENT_ACCEPT) return; // 已进入后续阶段,不重复打招呼
+    const target = task.chatId || task.externalUserId || task.wxid;
+    if (!target) { this.logger.warn(`[欢迎语] task ${task.taskId} 无会话标识,等候选人开口再发`); return; }
     const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'), (task as any).round);
-    if (task.chatId) {
-      const r = await this.miaohui.sendText(task.chatId, welcome);
-      this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code}`);
-    } else {
-      this.logger.warn(`[欢迎语] task ${task.taskId} 无 chatId，跳过`);
-    }
+    const r = await this.miaohui.sendText(target, welcome);
+    this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code} via=${task.chatId ? 'chatId' : 'extId'}`);
+    if (!r.ok) return; // 没发出去,保持 CONFIRMED,等 onMessage 兜底
     task.status = ReachStatus.WELCOMED;
     await task.save();
     await this.appendTimeline(task.taskId, 'WELCOMED', '已发带时间欢迎语');
@@ -404,6 +406,12 @@ export class ReachService {
             note = `候选人想改期(还没给到具体哪天:${text.slice(0, 20)})，AI引导区间中(第${task.rescheduleAsks}轮)`;
           }
           break;
+        }
+        // 已约成后候选人重复确认:不重复建日程/不重复通知,只回一句(玄玄:约成只通知一次)
+        if (task.status === ReachStatus.INTENT_ACCEPT && task.meetingLink) {
+          if (task.chatId) await this.miaohui.sendText(task.chatId,
+            `您的面试已经约好啦，${formatInterviewTimeText(task.interviewTime)}，到时见~`);
+          return;
         }
         status = ReachStatus.INTENT_ACCEPT;
         task.rescheduleAsks = 0; task.pendingTime = '';
@@ -482,9 +490,8 @@ export class ReachService {
     await this.appendTimeline(task.taskId, `INTENT_${intent}`, given || '');
     const who = task.name || task.phone;
     // 确认→通知HR；改约/拒绝/知识库答不上→转人工（表格服务置「转人工=是」+通知HR）
-    if (status === ReachStatus.INTENT_ACCEPT) {
-      await this.notifyHr(`✅【候选人确认】${who} 确认面试${given ? `：${given}` : ''}${meetingLink ? `\n会议链接：${meetingLink}` : ''}`);
-    } else if (status === ReachStatus.INTENT_RESCHEDULE) {
+    // 约成通知统一由表格服务侧「一面约成」发(含@面试官+勾一面+会议链接),这里不重复发(玄玄:只通知一次)
+    if (status === ReachStatus.INTENT_RESCHEDULE) {
       // 改期不转人工(玄玄规格):AI已回复"跟面试官确认",通过回填把 expectTime 带给表格服务→@一面面试官拍板;
       // 面试官改一面时间即拍板,表格服务调 /notify → notifyTimeChange 自动通知候选人新时间。
       if (expectTime) {
@@ -534,9 +541,13 @@ export class ReachService {
     task.status = ReachStatus.CONFIRMED;
     task.wxid = body.wxid || task.wxid;
     task.externalUserId = body.externalUserId || body.externalUserid || task.externalUserId;
+    if (body.chatId) task.chatId = body.chatId;
     await task.save();
     await this.appendTimeline(task.taskId, 'CONFIRMED', `好友通过 wxid=${task.wxid} extId=${task.externalUserId || '无'}`);
     this.logger.log(`[friend/confirm] ${task.name || task.phone} 好友已通过 extId=${task.externalUserId || '无'}`);
+    // 好友通过即主动发首条邀约,不等候选人先开口(玄玄需求)。发不出去(还没会话标识)时保持
+    // CONFIRMED,候选人开口后 onMessage 会兜底补发。
+    await this.sendWelcome(task);
   }
 
   /** 加好友结果：code=1 失败 → ADD_FAILED + 通知HR */
@@ -655,7 +666,7 @@ export class ReachService {
       await this.appendTimeline(task.taskId, 'SCHEDULE_SKIP', `未匹配到 HR（面试官=${interviewer || '未知'}）`);
       return '';
     }
-    const end = start + 60 * 60 * 1000; // 结束=开始+1小时
+    const end = start + 30 * 60 * 1000; // 结束=开始+30分钟(玄玄:面试统一30min)
     try {
       const { eventId, meetingUrl } = await this.feishu.createInterviewEvent({
         hrEmail,
@@ -663,7 +674,7 @@ export class ReachService {
         summary: `线上面试-${task.position || '岗位待定'}-${task.name || task.phone}`,
         startTime: start,
         endTime: end,
-        description: `候选人：${task.name || ''}（${task.phone}）\n岗位：${task.position || ''}\n面试官：${interviewer || '（未指定）'}${task.evalDoc ? `\n面评：${task.evalDoc}` : ''}`,
+        description: `候选人：${task.name || ''}（${task.phone}）\n岗位：${task.position || ''}\n面试官：${interviewer || '（未指定）'}`,
       });
       task.meetingLink = meetingUrl || '';
       task.scheduleEventId = eventId || '';
