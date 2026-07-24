@@ -144,6 +144,9 @@ const INTENT_STATUS: Record<string, ReachStatus> = {
 @Injectable()
 export class ReachService {
   private readonly logger = new Logger(ReachService.name);
+  // 防抖:候选人连发多条 → 攒几秒合并成一段再理解、只回一条连贯的(治"串行乱回")
+  private readonly msgBuffer = new Map<string, { texts: string[]; timer: NodeJS.Timeout }>();
+  private readonly DEBOUNCE_MS = 4000;
   private get dry() { return this.config.getBool('DRY_RUN', true); }
   private get PROG_APP() { return this.config.get('PROG_APP_TOKEN'); }
   private get PROG_TBL() { return this.config.get('PROG_TABLE_ID'); }
@@ -372,7 +375,31 @@ export class ReachService {
     }
     const text = this.extractMsgText(d);
     if (!text) return;
-    await this.handleReply(task, text);
+    // 防抖:不立即回;攒进缓冲,等 DEBOUNCE_MS 内候选人不再发,合并成一段再处理(治串行乱回)
+    this.bufferMessage(task.taskId, text);
+  }
+
+  /** 把候选人这条消息攒进缓冲,重置计时器;静默 DEBOUNCE_MS 后 flush 合并处理。 */
+  private bufferMessage(taskId: string, text: string) {
+    const buf = this.msgBuffer.get(taskId) || { texts: [], timer: null as any };
+    buf.texts.push(text);
+    if (buf.timer) clearTimeout(buf.timer);
+    buf.timer = setTimeout(() => { this.flushMessages(taskId).catch((e) => this.logger.error(`[flush] ${taskId}: ${e?.message}`)); }, this.DEBOUNCE_MS);
+    this.msgBuffer.set(taskId, buf);
+  }
+
+  /** 合并这段时间候选人连发的几条 → 一次 handleReply(理解更连贯)。flush 时重取任务、再校验转人工。 */
+  private async flushMessages(taskId: string) {
+    const buf = this.msgBuffer.get(taskId);
+    this.msgBuffer.delete(taskId);
+    if (!buf || !buf.texts.length) return;
+    const combined = buf.texts.join('\n');
+    const task = await this.taskModel.findOne({ taskId }).sort({ createdAt: -1 }).exec();
+    if (!task) return;
+    if (task.humanTakeover) { this.logger.log(`[防抖flush] ${taskId} 已转人工,跳过`); return; }
+    if (buf.texts.length > 1) this.logger.log(`[防抖] ${task.name || task.phone} 合并 ${buf.texts.length} 条: ${combined.replace(/\n/g, ' | ').slice(0, 80)}`);
+    await this.recordHistory(task, 'candidate', combined);
+    await this.handleReply(task, combined);
   }
 
   /** 发带时间欢迎语（秒回 /message/send）。幂等:已发过直接返回;发送成功才推进 WELCOMED,
@@ -405,8 +432,77 @@ export class ReachService {
     return null;
   }
 
+  /** 记一轮对话进 task.history(给智能体做上下文),只留最近 10 轮。 */
+  private async recordHistory(task: ReachTaskDocument, role: 'candidate' | 'ai', text: string) {
+    if (!text) return;
+    task.history = [...(task.history || []), { role, text: text.slice(0, 500), at: new Date() }].slice(-10);
+    try { await task.save(); } catch { /* 历史非关键,并发保存冲突忽略 */ }
+  }
+
+  /** live 模式:智能体接管——先发它生成的回复,再按它判定的 action 走"已验证的关键动作"(动作由代码执行+校验,模型只提议)。 */
+  private async executeAgentTurn(task: ReachTaskDocument, text: string, agent: { reply: string; action: string; time: string }) {
+    const who = task.name || task.phone;
+    if (task.chatId && agent.reply) await this.miaohui.sendText(task.chatId, agent.reply);
+    await this.recordHistory(task, 'ai', agent.reply);
+    this.logger.log(`[智能体·真跑] ${who} 回「${agent.reply.slice(0, 50)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''}`);
+    switch (agent.action) {
+      case 'confirm':
+        task.status = ReachStatus.INTENT_ACCEPT;
+        if (!task.meetingLink) await this.scheduleInterview(task, {});
+        await task.save();
+        await this.backfillProgress(task, '候选人确认面试时间(智能体)', 'INTENT_ACCEPT');
+        break;
+      case 'propose_reschedule':
+        task.status = ReachStatus.INTENT_RESCHEDULE;
+        task.pendingTime = agent.time || text.slice(0, 30);
+        await task.save();
+        await this.notifyHr(`🔄【候选人要改期】${who} 希望调整到【${task.pendingTime}】，请一面面试官在进度表改「一面时间」拍板，确认后会自动通知候选人。`);
+        await this.backfillProgress(task, `候选人期望改到${task.pendingTime}(智能体)`, 'INTENT_RESCHEDULE', task.pendingTime);
+        break;
+      case 'handover':
+        task.status = ReachStatus.HANDOVER;
+        await task.save();
+        await this.requestHandover(task, 'USER_REQUEST', '智能体判定转人工', text);
+        await this.backfillProgress(task, '智能体转人工', 'HANDOVER');
+        break;
+      case 'reject_close':
+        task.status = ReachStatus.INTENT_REJECT;
+        await task.save();
+        await this.requestHandover(task, 'REJECT', '候选人拒绝(智能体)', text);
+        break;
+      default:
+        if (task.status === ReachStatus.WELCOMED) task.status = ReachStatus.REPLIED;
+        await task.save();
+    }
+  }
+
+  /** 拼"任务状态上下文"给模型:应聘岗位/已约时间/当前状态,让判意图和答疑更准、不答非所问。 */
+  private buildContext(task: ReachTaskDocument): string {
+    const parts: string[] = [];
+    if (task.position) parts.push(`应聘岗位：${task.position}`);
+    if (task.interviewTime) parts.push(`${task.round || '一面'}已约时间：${formatInterviewTimeText(task.interviewTime)}`);
+    const statusMap: Partial<Record<ReachStatus, string>> = {
+      [ReachStatus.INTENT_ACCEPT]: '面试已确认约成',
+      [ReachStatus.WELCOMED]: '已发面试邀约,正等候选人确认时间',
+      [ReachStatus.INTENT_RESCHEDULE]: '候选人要改期,正在对时间',
+    };
+    parts.push(`当前状态：${statusMap[task.status] || '沟通中'}`);
+    return `【对话背景】${parts.join('；')}。`;
+  }
+
   private async handleReply(task: ReachTaskDocument, text: string) {
-    const intent = this.quickIntent(text) || await this.llm.classifyIntent(text);
+    const ctx = this.buildContext(task);
+    // 对话智能体开关:off=纯模板(现状)| shadow=模板照常服务+智能体只记录"它会怎么回"(验证用)| live=智能体真接管
+    const agentMode = (this.config.get('REPLY_AGENT_MODE') || process.env.REPLY_AGENT_MODE || 'off').toString();
+    if (agentMode !== 'off') {
+      const agent = await this.llm.agentTurn({ context: ctx, history: (task.history || []).map((h) => ({ role: h.role, text: h.text })), message: text });
+      if (agent) {
+        if (agentMode === 'live') return await this.executeAgentTurn(task, text, agent);
+        this.logger.log(`[智能体·影子] ${task.name || task.phone} 候选人「${text.replace(/\n/g, ' ').slice(0, 50)}」→ 模型会回「${agent.reply.slice(0, 60)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''}`);
+      }
+      // agent 为 null(解析失败) → 回退下面的模板流程
+    }
+    const intent = this.quickIntent(text) || await this.llm.classifyIntent(text, ctx);
     const given = extractTime(text);
     const slot = extractTimeSlot(text);
     let reply = ''; let status: ReachStatus = ReachStatus.REPLIED; let note = '';
@@ -491,7 +587,7 @@ export class ReachService {
         break;
       case 'QUESTION':
         status = ReachStatus.INTENT_QUESTION;
-        reply = await this.llm.answer(text);
+        reply = await this.llm.answer(text, ctx);
         note = `候选人提问：${text.slice(0, 30)}`;
         break;
       default:
@@ -507,10 +603,10 @@ export class ReachService {
           return;
         }
         status = ReachStatus.REPLIED;
-        reply = await this.llm.answer(text);
+        reply = await this.llm.answer(text, ctx);
         note = '';
     }
-    if (task.chatId && reply) await this.miaohui.sendText(task.chatId, reply);
+    if (task.chatId && reply) { await this.miaohui.sendText(task.chatId, reply); await this.recordHistory(task, 'ai', reply); }
     task.intent = intent;
     if (intent !== 'QUESTION') task.status = status;
     else if (task.status === ReachStatus.WELCOMED) task.status = ReachStatus.REPLIED;
