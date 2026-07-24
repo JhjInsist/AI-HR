@@ -147,6 +147,23 @@ export class ReachService {
   // 防抖:候选人连发多条 → 攒几秒合并成一段再理解、只回一条连贯的(治"串行乱回")
   private readonly msgBuffer = new Map<string, { texts: string[]; timer: NodeJS.Timeout }>();
   private readonly DEBOUNCE_MS = 4000;
+  // 记下"我们(AI)发给候选人的消息文本",用于在 isSelf 回调时区分"AI 自己发的回声"vs"真人 HR 打的"→ 真人打的自动转人工。
+  // 按文本匹配(不带 chatId):宁可漏检真人(AI继续回,顶多多聊两句),也别误把 AI 回声当真人 → 误停 AI。
+  private readonly recentSends = new Map<string, number>();  // key=文本前60字, value=时间戳
+  private sk(text: string) { return (text || '').trim().slice(0, 60); }
+  /** 统一的给候选人发消息:发前记一笔(用于回声识别),再真发。所有 AI→候选人的消息都走这里。 */
+  private async sendCandidate(chatId: string, text: string) {
+    if (!chatId || !text) return { ok: false, code: -97 } as any;
+    const now = Date.now();
+    this.recentSends.set(this.sk(text), now);
+    if (this.recentSends.size > 500) for (const [k, t] of this.recentSends) if (now - t > 300_000) this.recentSends.delete(k);
+    return this.miaohui.sendText(chatId, text);
+  }
+  /** 这条 isSelf 消息是不是我们 AI 刚发的回声(5 分钟内发过一样的文本)。 */
+  private isOurSend(text: string): boolean {
+    const t = this.recentSends.get(this.sk(text));
+    return !!t && Date.now() - t < 300_000;
+  }
   private get dry() { return this.config.getBool('DRY_RUN', true); }
   private get PROG_APP() { return this.config.get('PROG_APP_TOKEN'); }
   private get PROG_TBL() { return this.config.get('PROG_TABLE_ID'); }
@@ -260,7 +277,7 @@ export class ReachService {
     const rd = round || task.round || '一面';
     const timeText = formatInterviewTimeText(interviewTime);
     const text = `${task.name || '您'}您好~ 跟您同步一下：您的${rd}面试时间调整为【${timeText}】。方便的话回复「可以」确认；如有冲突，回复您方便的时间就好~`;
-    const r = await this.miaohui.sendText(task.chatId, text);
+    const r = await this.sendCandidate(task.chatId, text);
     if (!r.ok) return { ok: false, msg: `发送失败 code=${r.code}` };
     task.interviewTime = interviewTime;
     task.round = rd;
@@ -351,8 +368,6 @@ export class ReachService {
   }
 
   private async onMessage(d: any, id?: string) {
-    if (d?.isSelf === true) return; // 自己发的消息忽略
-    if (!this.inWorkHours()) { this.logger.log('[工作时间外] 不聊天,消息暂不处理'); return; }
     const chatId = (d?.chatId || '').toString();
     const extId = (d?.externalUserId || d?.contactId || '').toString().trim();
     if (!extId) return;
@@ -362,6 +377,14 @@ export class ReachService {
       .sort({ createdAt: -1 }).exec();
     if (!task) { this.logger.log(`[消息] 未匹配触达任务 extId=${extId}`); return; }
     if (chatId && task.chatId !== chatId) { task.chatId = chatId; await task.save(); }
+    // isSelf=托管号自己发的:可能是 AI 的回声,也可能是真人 HR 在秒回工作台手动回了候选人。
+    // 不是我们AI发的回声 → 真人回了 → 自动切转人工(玄玄需求13:00),之后 AI 闭嘴,取消转人工才恢复。
+    if (d?.isSelf === true) {
+      const stext = this.extractMsgText(d);
+      if (stext && !this.isOurSend(stext) && !task.humanTakeover) await this.onHumanReply(task, stext);
+      return;
+    }
+    if (!this.inWorkHours()) { this.logger.log('[工作时间外] 不聊天,消息暂不处理'); return; }
     // 转人工中：AI 一律不接待，候选人消息由 HR 真人在企微跟进，只留痕
     if (task.humanTakeover) {
       this.logger.log(`[消息] ${task.name || task.phone} 已转人工，AI 不接待`);
@@ -410,7 +433,7 @@ export class ReachService {
     const target = task.chatId || task.externalUserId || task.wxid;
     if (!target) { this.logger.warn(`[欢迎语] task ${task.taskId} 无会话标识,等候选人开口再发`); return; }
     const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'), (task as any).round);
-    const r = await this.miaohui.sendText(target, welcome);
+    const r = await this.sendCandidate(target, welcome);
     this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code} via=${task.chatId ? 'chatId' : 'extId'}`);
     if (!r.ok) return; // 没发出去,保持 CONFIRMED,等 onMessage 兜底
     task.status = ReachStatus.WELCOMED;
@@ -439,10 +462,22 @@ export class ReachService {
     try { await task.save(); } catch { /* 历史非关键,并发保存冲突忽略 */ }
   }
 
+  /** 真人 HR 在秒回工作台手动回了候选人(检测到非 AI 回声的 isSelf 消息)→ 自动转人工(玄玄需求13:00)。
+   *  之后 AI 一律不接待候选人消息;HR 在进度表取消【转人工】勾选 → rule5 同步回来恢复 AI。 */
+  private async onHumanReply(task: ReachTaskDocument, humanText: string) {
+    task.humanTakeover = true;
+    task.status = ReachStatus.HANDOVER;
+    await task.save();
+    await this.recordHistory(task, 'ai', `[真人HR] ${humanText}`);
+    this.logger.log(`[真人接入] ${task.name || task.phone} HR手动回复「${humanText.slice(0, 40)}」→ 自动转人工`);
+    await this.requestHandover(task, 'HUMAN_REPLY', `HR 在秒回工作台手动回复了候选人,自动转人工`, humanText);
+    await this.backfillProgress(task, '检测到真人 HR 回复,自动转人工', 'HANDOVER');
+  }
+
   /** live 模式:智能体接管——先发它生成的回复,再按它判定的 action 走"已验证的关键动作"(动作由代码执行+校验,模型只提议)。 */
   private async executeAgentTurn(task: ReachTaskDocument, text: string, agent: { reply: string; action: string; time: string }) {
     const who = task.name || task.phone;
-    if (task.chatId && agent.reply) await this.miaohui.sendText(task.chatId, agent.reply);
+    if (task.chatId && agent.reply) await this.sendCandidate(task.chatId, agent.reply);
     await this.recordHistory(task, 'ai', agent.reply);
     this.logger.log(`[智能体·真跑] ${who} 回「${agent.reply.slice(0, 50)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''}`);
     switch (agent.action) {
@@ -533,7 +568,7 @@ export class ReachService {
         }
         // 已约成后候选人重复确认:不重复建日程/不重复通知,只回一句(玄玄:约成只通知一次)
         if (task.status === ReachStatus.INTENT_ACCEPT && task.meetingLink) {
-          if (task.chatId) await this.miaohui.sendText(task.chatId,
+          if (task.chatId) await this.sendCandidate(task.chatId,
             `您的面试已经约好啦，${formatInterviewTimeText(task.interviewTime)}，到时见~`);
           return;
         }
@@ -566,7 +601,7 @@ export class ReachService {
         break;
       case 'HUMAN':
         reply = '好的~ 我让我们招聘同事直接来跟您对接哈，稍等一下下~';
-        if (task.chatId) await this.miaohui.sendText(task.chatId, reply);
+        if (task.chatId) await this.sendCandidate(task.chatId, reply);
         task.status = ReachStatus.HANDOVER;
         await task.save();
         await this.requestHandover(task, 'USER_REQUEST', '候选人要求人工对接', text);
@@ -595,7 +630,7 @@ export class ReachService {
         task.otherStreak = (task.otherStreak || 0) + 1;
         if (task.otherStreak >= 3) {
           reply = '不好意思哈~ 我让我们招聘同事直接来跟您沟通，稍等一下下~';
-          if (task.chatId) await this.miaohui.sendText(task.chatId, reply);
+          if (task.chatId) await this.sendCandidate(task.chatId, reply);
           task.status = ReachStatus.HANDOVER;
           await task.save();
           await this.requestHandover(task, 'USER_REQUEST', '连续三轮没听懂候选人意图，AI退出', text);
@@ -606,7 +641,7 @@ export class ReachService {
         reply = await this.llm.answer(text, ctx);
         note = '';
     }
-    if (task.chatId && reply) { await this.miaohui.sendText(task.chatId, reply); await this.recordHistory(task, 'ai', reply); }
+    if (task.chatId && reply) { await this.sendCandidate(task.chatId, reply); await this.recordHistory(task, 'ai', reply); }
     task.intent = intent;
     if (intent !== 'QUESTION') task.status = status;
     else if (task.status === ReachStatus.WELCOMED) task.status = ReachStatus.REPLIED;
@@ -891,7 +926,7 @@ export class ReachService {
         continue;
       }
       await t.save();
-      if (t.chatId) await this.miaohui.sendText(t.chatId, '您好呀~ 面试时间上您考虑得怎么样啦？给我个大概方便的时间段就行（比如「周四周五下午」），我去协调面试官~');
+      if (t.chatId) await this.sendCandidate(t.chatId, '您好呀~ 面试时间上您考虑得怎么样啦？给我个大概方便的时间段就行（比如「周四周五下午」），我去协调面试官~');
       await this.appendTimeline(t.taskId, 'REVISIT', `第${t.revisits}次回访`);
     }
     if (silent.length || pending.length) this.logger.log(`[扫描] 沉默转人工${silent.length} 改期回访${pending.length}`);
@@ -900,7 +935,7 @@ export class ReachService {
   /** 改期沟通3轮仍拿不到具体时间 → 不硬聊,转人工(玄玄定的兜底) */
   private async rescheduleStuck(task: ReachTaskDocument, text: string) {
     const reply = '好嘞~ 那我让我们招聘同事直接来跟您对时间，稍等一下下哈~';
-    if (task.chatId) await this.miaohui.sendText(task.chatId, reply);
+    if (task.chatId) await this.sendCandidate(task.chatId, reply);
     task.status = ReachStatus.HANDOVER;
     await task.save();
     await this.appendTimeline(task.taskId, 'RESCHEDULE_STUCK', '3轮追问未拿到具体改期时间');
