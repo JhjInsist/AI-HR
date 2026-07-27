@@ -134,7 +134,12 @@ export function isSafeAgentConfirm(text: string, interviewTimeRaw?: string): boo
   const t = (text || '').trim();
   if (!t) return false;
   const slot = extractTimeSlot(t);
-  const explicitAck = /^(可以|好的|好呀|好嘞|没问题|行|行的|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)/i.test(t);
+  // 只查开头不够:"行,我再想想""好的,那不来了""可以,那薪资多少"这类开头像确认、后半句语义反转/追问的话
+  // 会被单纯的前缀匹配误判成"明确应答"。改成:整句必须能被"确认词+语气助词/标点"完全铺满,不能带别的实质内容
+  // (允许"好的没问题"这类确认词连着说两遍)。
+  const ACK_TOKEN = '(?:可以|好的|好呀|好嘞|没问题|行的|行|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)';
+  const FILLER = '(?:[，,。.!！~～\\s呀啦哈哦噢的呢])';
+  const explicitAck = new RegExp(`^(?:${ACK_TOKEN}|${FILLER})+$`, 'i').test(t) && new RegExp(ACK_TOKEN, 'i').test(t);
   if (!explicitAck && !slot.date && !slot.clock) return false;
   return sameAsScheduled(slot, interviewTimeRaw);
 }
