@@ -139,6 +139,21 @@ export function isSafeAgentConfirm(text: string, interviewTimeRaw?: string): boo
   return sameAsScheduled(slot, interviewTimeRaw);
 }
 
+/** 对话智能体只能在候选人原话确有"时间信号"或"改期意向词"时执行 propose_reschedule。
+ * 防模型从无关内容(如单纯致谢、答疑追问)里凭空捏造一个改期动作。 */
+export function isSafeAgentReschedule(text: string): boolean {
+  const t = (text || '').trim();
+  if (!t) return false;
+  const slot = extractTimeSlot(t);
+  if (slot.date || slot.clock || slot.part) return true;
+  return /改期|改约|改一下|改个时间|换时间|换个时间|调整.*时间|另约|不方便|不行|时间.*不(合适|行)|下周|这周|忙|没空|排班/.test(t);
+}
+
+/** 候选人原话是否带"不想来"的拒绝信号(不区分首次/再次,单纯做信号识别，与 quickIntent 的 REJECT 判据保持一致)。 */
+export function hasDeclineSignal(text: string): boolean {
+  return /不考虑|不来了|不面了|不去了|已入职|入职了|找到工作|算了不|放弃|不感兴趣|暂时不需要/.test((text || '').trim());
+}
+
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
 const INTENT_STATUS: Record<string, ReachStatus> = {
   ACCEPT: ReachStatus.INTENT_ACCEPT, TIME: ReachStatus.INTENT_ACCEPT, 确认: ReachStatus.INTENT_ACCEPT,
@@ -487,11 +502,16 @@ export class ReachService {
   }
 
   /** live 模式:智能体接管——先发它生成的回复,再按它判定的 action 走"已验证的关键动作"(动作由代码执行+校验,模型只提议)。 */
-  private async executeAgentTurn(task: ReachTaskDocument, text: string, agent: { reply: string; action: string; time: string }) {
+  private async executeAgentTurn(task: ReachTaskDocument, text: string, agent: { reply: string; action: string; time: string; confidence: number }) {
     const who = task.name || task.phone;
     if (task.chatId && agent.reply) await this.sendCandidate(task.chatId, agent.reply);
     await this.recordHistory(task, 'ai', agent.reply);
-    this.logger.log(`[智能体·真跑] ${who} 回「${agent.reply.slice(0, 50)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''}`);
+    this.logger.log(`[智能体·真跑] ${who} 回「${agent.reply.slice(0, 50)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''} 把握度:${agent.confidence}`);
+    // 候选人这轮流露拒绝信号、且不是执行 reject_close 本身 → 记一笔"已问过一次"，
+    // 供下一轮 reject_close 的确定性校验放行(实现"先挽留问原因,再拒才关闭"的两步规格，即使全程走智能体也不失效)。
+    if (agent.action !== 'reject_close' && hasDeclineSignal(text) && !task.rejectAsked) {
+      task.rejectAsked = true;
+    }
     switch (agent.action) {
       case 'confirm':
         task.status = ReachStatus.INTENT_ACCEPT;
@@ -534,6 +554,9 @@ export class ReachService {
       [ReachStatus.INTENT_RESCHEDULE]: '候选人要改期,正在对时间',
     };
     parts.push(`当前状态：${statusMap[task.status] || '沟通中'}`);
+    // 显式告知"已经问过一次拒绝原因"这个状态，别指望模型自己从历史里推断——
+    // 防抖合并/历史只留最近10轮时，这个关键状态容易被稀释掉，导致反复重复同一句"方便说下原因吗"。
+    if (task.rejectAsked) parts.push('已经问过候选人一次婉拒原因；如果候选人这轮再次明确拒绝，就是真的不来了，可以直接回应告别');
     return `【对话背景】${parts.join('；')}。`;
   }
 
@@ -545,12 +568,20 @@ export class ReachService {
       const agent = await this.llm.agentTurn({ context: ctx, history: (task.history || []).map((h) => ({ role: h.role, text: h.text })), message: text });
       if (agent) {
         if (agentMode === 'live') {
-          if (agent.action !== 'confirm' || isSafeAgentConfirm(text, task.interviewTime)) {
+          // 关键动作(约成/改期/拒绝关闭)各自的确定性校验：模型只"提议"，代码校验候选人原话确实支持这个动作才放行；
+          // 校验不过 → 整轮回退到下面的确定性模板流程(quickIntent/classifyIntent)，不部分执行模型的判断。
+          // handover 不设硬拦截(转人工的风险是"多打扰HR一次"，远小于"该转没转"，宁可放宽)。
+          const safe =
+            agent.action === 'confirm' ? isSafeAgentConfirm(text, task.interviewTime) :
+            agent.action === 'propose_reschedule' ? isSafeAgentReschedule(text) :
+            agent.action === 'reject_close' ? task.rejectAsked === true :
+            true;
+          if (safe) {
             return await this.executeAgentTurn(task, text, agent);
           }
-          this.logger.warn(`[智能体·动作拦截] ${task.name || task.phone} 模型误判 confirm，回退确定性流程：${text.slice(0, 60)}`);
+          this.logger.warn(`[智能体·动作拦截] ${task.name || task.phone} 模型误判 ${agent.action}(把握度${agent.confidence})，回退确定性流程：${text.slice(0, 60)}`);
         }
-        this.logger.log(`[智能体·影子] ${task.name || task.phone} 候选人「${text.replace(/\n/g, ' ').slice(0, 50)}」→ 模型会回「${agent.reply.slice(0, 60)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''}`);
+        this.logger.log(`[智能体·影子] ${task.name || task.phone} 候选人「${text.replace(/\n/g, ' ').slice(0, 50)}」→ 模型会回「${agent.reply.slice(0, 60)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''} 把握度:${agent.confidence}`);
       }
       // agent 为 null(解析失败) → 回退下面的模板流程
     }
