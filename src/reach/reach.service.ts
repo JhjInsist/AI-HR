@@ -127,6 +127,18 @@ export function sameAsScheduled(slot: ReturnType<typeof extractTimeSlot>, interv
   return true; // 只说"可以/好的"没带任何时间
 }
 
+/** 对话智能体只能在候选人明确确认当前已约时间时执行 confirm。
+ * 模型把答疑、含糊回复或不同时间误判成 confirm 时，调用方必须回退确定性流程。 */
+export function isSafeAgentConfirm(text: string, interviewTimeRaw?: string): boolean {
+  if (!parseInterviewTime(interviewTimeRaw)) return false;
+  const t = (text || '').trim();
+  if (!t) return false;
+  const slot = extractTimeSlot(t);
+  const explicitAck = /^(可以|好的|好呀|好嘞|没问题|行|行的|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)/i.test(t);
+  if (!explicitAck && !slot.date && !slot.clock) return false;
+  return sameAsScheduled(slot, interviewTimeRaw);
+}
+
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
 const INTENT_STATUS: Record<string, ReachStatus> = {
   ACCEPT: ReachStatus.INTENT_ACCEPT, TIME: ReachStatus.INTENT_ACCEPT, 确认: ReachStatus.INTENT_ACCEPT,
@@ -532,7 +544,12 @@ export class ReachService {
     if (agentMode !== 'off') {
       const agent = await this.llm.agentTurn({ context: ctx, history: (task.history || []).map((h) => ({ role: h.role, text: h.text })), message: text });
       if (agent) {
-        if (agentMode === 'live') return await this.executeAgentTurn(task, text, agent);
+        if (agentMode === 'live') {
+          if (agent.action !== 'confirm' || isSafeAgentConfirm(text, task.interviewTime)) {
+            return await this.executeAgentTurn(task, text, agent);
+          }
+          this.logger.warn(`[智能体·动作拦截] ${task.name || task.phone} 模型误判 confirm，回退确定性流程：${text.slice(0, 60)}`);
+        }
         this.logger.log(`[智能体·影子] ${task.name || task.phone} 候选人「${text.replace(/\n/g, ' ').slice(0, 50)}」→ 模型会回「${agent.reply.slice(0, 60)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''}`);
       }
       // agent 为 null(解析失败) → 回退下面的模板流程
