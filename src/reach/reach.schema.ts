@@ -103,6 +103,9 @@ export class ReachTask {
 
   @Prop({ type: [{ at: Date, event: String, detail: String }], default: [] })
   timeline: TimelineEntry[];           // 全流程留痕
+
+  @Prop({ type: [{ role: String, text: String, at: Date }], default: [] })
+  history: { role: string; text: string; at: Date }[];  // 对话历史(candidate/ai 最近几轮),给对话智能体做上下文
 }
 
 export const ReachTaskSchema = SchemaFactory.createForClass(ReachTask);
