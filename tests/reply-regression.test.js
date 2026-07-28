@@ -22,6 +22,7 @@ function query(result) {
 
 function makeService(sendByWecom, taskForQueries = null) {
   const timeline = [];
+  const handovers = [];
   const model = {
     updateOne: (_filter, update) => ({
       exec: async () => {
@@ -43,10 +44,17 @@ function makeService(sendByWecom, taskForQueries = null) {
   };
   const hr = {};
   const llm = { agentTurn: async () => { throw new Error('纯确认结束语不应调用模型'); } };
-  const table = {};
+  const table = {
+    handover: async (payload) => {
+      handovers.push(payload);
+      return {};
+    },
+    backfill: async () => ({}),
+  };
   return {
     service: new ReachService(model, redis, config, feishu, miaohui, hr, llm, table),
     timeline,
+    handovers,
   };
 }
 
@@ -196,6 +204,64 @@ async function main() {
   assert.equal(callbackCalls.length, 1, '非文本回调不得触发任何候选人回复');
   assert.ok(callbackTimeline.some((item) => item.event === 'MSG_SKIP_NON_TEXT'));
 
+  const aiEchoTask = {
+    ...task,
+    taskId: 'RT-ai-echo',
+    status: ReachStatus.WELCOMED,
+    chatId: '',
+    externalUserId: 'wm-ai-echo',
+    humanTakeover: false,
+  };
+  const { service: aiEchoService, handovers: aiEchoHandovers } = makeService(
+    async () => ({ ok: true, code: 0 }),
+    aiEchoTask,
+  );
+  await aiEchoService.sendCandidateByWecom('zhangsan', 'wm-ai-echo', '您好');
+  await aiEchoService.handleCallback({
+    data: {
+      messageId: 'ai-echo-message',
+      chatId: 'chat-ai-echo',
+      contactId: 'wx-ai-echo',
+      externalUserId: 'wm-ai-echo',
+      isSelf: true,
+      type: 7,
+      payload: { text: '您好' },
+    },
+  });
+  assert.equal(aiEchoTask.humanTakeover, false, '同一候选人的 AI 发送回声不能误触发转人工');
+  assert.equal(aiEchoHandovers.length, 0, 'AI 发送回声不能发起转人工请求');
+
+  const proactiveHrTask = {
+    ...task,
+    taskId: 'RT-proactive-hr',
+    dataId: 'rec-proactive-hr',
+    phone: '13900000000',
+    status: ReachStatus.WELCOMED,
+    chatId: '',
+    externalUserId: 'wm-proactive-hr',
+    humanTakeover: false,
+  };
+  const { service: proactiveHrService, handovers: proactiveHrHandovers } = makeService(
+    async () => ({ ok: true, code: 0 }),
+    proactiveHrTask,
+  );
+  await proactiveHrService.sendCandidateByWecom('zhangsan', 'wm-another-candidate', '您好');
+  await proactiveHrService.handleCallback({
+    data: {
+      messageId: 'proactive-hr-message',
+      chatId: 'chat-proactive-hr',
+      contactId: 'wx-proactive-hr',
+      externalUserId: 'wm-proactive-hr',
+      isSelf: true,
+      type: 7,
+      payload: { text: '您好' },
+    },
+  });
+  assert.equal(proactiveHrTask.humanTakeover, true, 'HR 主动给候选人发消息后必须立即切换转人工');
+  assert.equal(proactiveHrTask.status, ReachStatus.HANDOVER);
+  assert.equal(proactiveHrHandovers.length, 1, 'HR 主动发消息必须向表格服务发起一次转人工');
+  assert.equal(proactiveHrHandovers[0].reason, 'HUMAN_REPLY');
+
   let apiRequest;
   const apiServer = http.createServer((req, res) => {
     let raw = '';
@@ -217,7 +283,7 @@ async function main() {
   assert.equal(apiRequest.body.wecomUserId, 'zhangsan');
   assert.equal(apiRequest.body.externalUserId, 'wm-api');
 
-  console.log('reply regression: 51/51 PASS');
+  console.log('reply regression: 57/57 PASS');
 }
 
 main().catch((error) => {

@@ -221,30 +221,46 @@ export class ReachService {
   private readonly msgBuffer = new Map<string, { texts: string[]; timer: NodeJS.Timeout }>();
   private readonly DEBOUNCE_MS = 4000;
   private readonly welcomeSending = new Set<string>();
-  // 记下"我们(AI)发给候选人的消息文本",用于在 isSelf 回调时区分"AI 自己发的回声"vs"真人 HR 打的"→ 真人打的自动转人工。
-  // 按文本匹配(不带 chatId):宁可漏检真人(AI继续回,顶多多聊两句),也别误把 AI 回声当真人 → 误停 AI。
-  private readonly recentSends = new Map<string, number>();  // key=文本前60字, value=时间戳
+  // 记下"AI 给哪位候选人发了什么",用于在 isSelf 回调时区分 AI 回声和真人 HR 主动消息。
+  // 必须带会话/候选人标识；只按文本匹配会把 HR 发给乙的话误认成 AI 刚发给甲的回声。
+  private readonly recentSends = new Map<string, number>();
   private sk(text: string) { return (text || '').trim().slice(0, 60); }
-  private rememberSend(text: string) {
+  private sendKey(kind: 'chat' | 'ext', id: string, text: string) {
+    return `${kind}:${id}:${this.sk(text)}`;
+  }
+  private rememberSend(kind: 'chat' | 'ext', id: string, text: string) {
+    if (!id || !text) return;
     const now = Date.now();
-    this.recentSends.set(this.sk(text), now);
+    this.recentSends.set(this.sendKey(kind, id, text), now);
     if (this.recentSends.size > 500) for (const [k, t] of this.recentSends) if (now - t > 300_000) this.recentSends.delete(k);
   }
   /** 统一的给候选人发消息:发前记一笔(用于回声识别),再真发。所有 AI→候选人的消息都走这里。 */
   private async sendCandidate(chatId: string, text: string) {
     if (!chatId || !text) return { ok: false, code: -97 } as any;
-    this.rememberSend(text);
+    this.rememberSend('chat', chatId, text);
     return this.miaohui.sendText(chatId, text);
   }
   private async sendCandidateByWecom(wecomUserId: string, externalUserId: string, text: string) {
     if (!wecomUserId || !externalUserId || !text) return { ok: false, code: -97 } as any;
-    this.rememberSend(text);
+    this.rememberSend('ext', externalUserId, text);
     return this.miaohui.sendTextByWecom(wecomUserId, externalUserId, text);
   }
-  /** 这条 isSelf 消息是不是我们 AI 刚发的回声(5 分钟内发过一样的文本)。 */
-  private isOurSend(text: string): boolean {
-    const t = this.recentSends.get(this.sk(text));
-    return !!t && Date.now() - t < 300_000;
+  /** 这条 isSelf 消息是不是 AI 在 5 分钟内发给同一候选人的回声。 */
+  private isOurSend(task: ReachTaskDocument, d: any, text: string): boolean {
+    const keys = new Set<string>();
+    const add = (kind: 'chat' | 'ext', id: unknown) => {
+      const value = (id || '').toString().trim();
+      if (value) keys.add(this.sendKey(kind, value, text));
+    };
+    add('chat', d?.chatId);
+    add('chat', task.chatId);
+    add('ext', d?.externalUserId);
+    add('ext', task.externalUserId);
+    const now = Date.now();
+    return [...keys].some((key) => {
+      const sentAt = this.recentSends.get(key);
+      return !!sentAt && now - sentAt < 300_000;
+    });
   }
   private get dry() { return this.config.getBool('DRY_RUN', true); }
   private get PROG_APP() { return this.config.get('PROG_APP_TOKEN'); }
@@ -464,7 +480,7 @@ export class ReachService {
     // 不是我们AI发的回声 → 真人回了 → 自动切转人工(玄玄需求13:00),之后 AI 闭嘴,取消转人工才恢复。
     if (d?.isSelf === true) {
       const stext = extractCandidateText(d);
-      if (stext && !this.isOurSend(stext) && !task.humanTakeover) await this.onHumanReply(task, stext);
+      if (stext && !this.isOurSend(task, d, stext) && !task.humanTakeover) await this.onHumanReply(task, stext);
       return;
     }
     const text = extractCandidateText(d);
@@ -587,16 +603,16 @@ export class ReachService {
     try { await task.save(); } catch { /* 历史非关键,并发保存冲突忽略 */ }
   }
 
-  /** 真人 HR 在秒回工作台手动回了候选人(检测到非 AI 回声的 isSelf 消息)→ 自动转人工(玄玄需求13:00)。
+  /** 真人 HR 在秒回工作台主动发起或回复候选人(检测到非 AI 回声的 isSelf 消息)→ 自动转人工。
    *  之后 AI 一律不接待候选人消息;HR 在进度表取消【转人工】勾选 → rule5 同步回来恢复 AI。 */
   private async onHumanReply(task: ReachTaskDocument, humanText: string) {
     task.humanTakeover = true;
     task.status = ReachStatus.HANDOVER;
     await task.save();
     await this.recordHistory(task, 'ai', `[真人HR] ${humanText}`);
-    this.logger.log(`[真人接入] ${task.name || task.phone} HR手动回复「${humanText.slice(0, 40)}」→ 自动转人工`);
-    await this.requestHandover(task, 'HUMAN_REPLY', `HR 在秒回工作台手动回复了候选人,自动转人工`, humanText);
-    await this.backfillProgress(task, '检测到真人 HR 回复,自动转人工', 'HANDOVER');
+    this.logger.log(`[真人接入] ${task.name || task.phone} HR主动发消息「${humanText.slice(0, 40)}」→ 自动转人工`);
+    await this.requestHandover(task, 'HUMAN_REPLY', 'HR 在秒回工作台主动发起或回复会话，自动转人工', humanText);
+    await this.backfillProgress(task, '检测到真人 HR 主动发起或回复会话，自动转人工', 'HANDOVER');
   }
 
   /** live 模式:智能体接管——先发它生成的回复,再按它判定的 action 走"已验证的关键动作"(动作由代码执行+校验,模型只提议)。 */
