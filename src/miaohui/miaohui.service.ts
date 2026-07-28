@@ -70,4 +70,29 @@ export class MiaohuiService {
       return { ok: false, code: -98, raw: e?.message?.slice(0, 120) };
     }
   }
+
+  /** 好友刚通过、尚未拿到 chatId 时主动发消息。
+   *  秒回现行小组级接口按「企微员工 userId + externalUserId」寻址，不依赖候选人先发消息。 */
+  async sendTextByWecom(
+    wecomUserId: string,
+    externalUserId: string,
+    text: string,
+  ): Promise<{ ok: boolean; code: number; raw?: any }> {
+    const token = this.config.get('MIAOHUI_GROUP_TOKEN');
+    if (!token) return { ok: false, code: -99, raw: '缺 MIAOHUI_GROUP_TOKEN' };
+    if (!wecomUserId || !externalUserId) {
+      return { ok: false, code: -97, raw: '缺 wecomUserId 或 externalUserId' };
+    }
+    try {
+      const { data } = await axios.post(
+        `${this.base}/message/sendByWecom`,
+        { token, wecomUserId, externalUserId, messageType: 0, payload: { text } },
+        { headers: { 'Content-Type': 'application/json' }, timeout: 30000 },
+      );
+      return { ok: data?.code === 0, code: data?.code, raw: data };
+    } catch (e: any) {
+      const detail = e?.response?.data ? JSON.stringify(e.response.data) : (e?.code || e?.message);
+      return { ok: false, code: -98, raw: detail?.slice?.(0, 200) || detail };
+    }
+  }
 }

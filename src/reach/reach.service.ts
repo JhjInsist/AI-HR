@@ -95,7 +95,7 @@ export function buildOpening(name?: string, position?: string, template?: string
  *  比 extractTime 宽:「周五下午」「明天」这类没钟点的也抓得到(改期收集要按槽位追问)。 */
 export function extractTimeSlot(text: string): { date?: string; part?: string; clock?: string; full: boolean; raw: string } {
   const t = (text || '').replace(/\s+/g, '');
-  const date = t.match(/(今天|明天|后天|大后天|下下?周[一二三四五六日天]|周[一二三四五六日天]|礼拜[一二三四五六日天]|\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号])/)?.[1];
+  const date = t.match(/(今天|明天|后天|大后天|下下?周[一二三四五六日天]|这周[一二三四五六日天]|周[一二三四五六日天]|礼拜[一二三四五六日天]|\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号])/)?.[1];
   const part = t.match(/(上午|下午|中午|晚上|早上|傍晚)/)?.[1];
   const clock = extractTime(t);
   const raw = [date && !(clock || '').includes(date) ? date : '', part && !(clock || '').includes(part) ? part : '', clock].filter(Boolean).join('');
@@ -109,11 +109,11 @@ export function sameAsScheduled(slot: ReturnType<typeof extractTimeSlot>, interv
   const d = new Date(ms + 8 * 3600 * 1000);
   const days = ['日', '一', '二', '三', '四', '五', '六'];
   const sameDay = !slot.date
-    || slot.date === `周${days[d.getUTCDay()]}` || slot.date === `礼拜${days[d.getUTCDay()]}`
+    || slot.date === `周${days[d.getUTCDay()]}` || slot.date === `这周${days[d.getUTCDay()]}` || slot.date === `礼拜${days[d.getUTCDay()]}`
     || slot.date === `${d.getUTCMonth() + 1}月${d.getUTCDate()}日` || slot.date === `${d.getUTCMonth() + 1}月${d.getUTCDate()}号`;
   if (!sameDay) return false;
   if (slot.clock) {
-    const hh = parseInt(slot.clock.match(/(\d{1,2})[:：点时]/)?.[1] || '-1', 10);
+    const hh = parseInt(slot.clock.match(/(\d{1,2})[:：.。点时]/)?.[1] || '-1', 10);
     let sch = d.getUTCHours();
     const cand12 = hh < 12 && (slot.clock.includes('下午') || slot.clock.includes('晚上')) ? hh + 12 : hh;
     return cand12 === sch || hh === sch || (sch > 12 && hh === sch - 12);
@@ -159,6 +159,47 @@ export function hasDeclineSignal(text: string): boolean {
   return /不考虑|不来了|不面了|不去了|已入职|入职了|找到工作|算了不|放弃|不感兴趣|暂时不需要/.test((text || '').trim());
 }
 
+/** 秒回候选人文本消息固定为 type/messageType=7（兼容旧回调 0）。
+ * 图片等消息可能把 messageId 放在 payload.content，绝不能当候选人原话交给模型。 */
+export function extractCandidateText(d: any): string {
+  const type = d?.messageType ?? d?.type;
+  if (type !== undefined && ![0, 7, '0', '7'].includes(type)) return '';
+  if (typeof d?.text === 'string') return d.text.trim();
+  const p = d?.payload;
+  if (typeof p === 'string') return p.trim();
+  if (!p || typeof p !== 'object') return '';
+  const text = p.text ?? p.pureText;
+  return typeof text === 'string' ? text.trim() : '';
+}
+
+/** 只识别整句都是礼貌确认的消息；“好的，那薪资多少”有实质内容，不能静默。 */
+export function isPureAcknowledgement(text: string): boolean {
+  const raw = (text || '').toLowerCase();
+  if (/^[\s，,。.!！~～👌👍✅]+$/u.test(raw) && /[👌👍✅]/u.test(raw)) return true;
+  let rest = raw.replace(/[\p{P}\p{S}\s]/gu, '');
+  if (!rest) return false;
+  const tokens = [
+    '没有问题', '沒問題', '没问题', '明白了', '知道了', '辛苦了', '到时见',
+    '嗯嗯好的', '嗯好的', '好嘞', '好呀', '好的', '可以', '收到',
+    '谢谢啦', '谢谢', '感谢', '行的', '方便', '确认', '同意',
+    'okay', 'ok', '嗯嗯', '嗯', '好', '行',
+  ];
+  while (rest) {
+    const token = tokens.find((item) => rest.startsWith(item));
+    if (!token) return false;
+    rest = rest.slice(token.length);
+  }
+  return true;
+}
+
+/** 已经约成/已进入等待拍板/已经结束后，纯礼貌确认无需继续回复。 */
+export function shouldSuppressAcknowledgement(status: ReachStatus, text: string): boolean {
+  if (![ReachStatus.INTENT_ACCEPT, ReachStatus.INTENT_RESCHEDULE, ReachStatus.INTENT_REJECT].includes(status)) {
+    return false;
+  }
+  return isPureAcknowledgement(text);
+}
+
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
 const INTENT_STATUS: Record<string, ReachStatus> = {
   ACCEPT: ReachStatus.INTENT_ACCEPT, TIME: ReachStatus.INTENT_ACCEPT, 确认: ReachStatus.INTENT_ACCEPT,
@@ -179,17 +220,26 @@ export class ReachService {
   // 防抖:候选人连发多条 → 攒几秒合并成一段再理解、只回一条连贯的(治"串行乱回")
   private readonly msgBuffer = new Map<string, { texts: string[]; timer: NodeJS.Timeout }>();
   private readonly DEBOUNCE_MS = 4000;
+  private readonly welcomeSending = new Set<string>();
   // 记下"我们(AI)发给候选人的消息文本",用于在 isSelf 回调时区分"AI 自己发的回声"vs"真人 HR 打的"→ 真人打的自动转人工。
   // 按文本匹配(不带 chatId):宁可漏检真人(AI继续回,顶多多聊两句),也别误把 AI 回声当真人 → 误停 AI。
   private readonly recentSends = new Map<string, number>();  // key=文本前60字, value=时间戳
   private sk(text: string) { return (text || '').trim().slice(0, 60); }
-  /** 统一的给候选人发消息:发前记一笔(用于回声识别),再真发。所有 AI→候选人的消息都走这里。 */
-  private async sendCandidate(chatId: string, text: string) {
-    if (!chatId || !text) return { ok: false, code: -97 } as any;
+  private rememberSend(text: string) {
     const now = Date.now();
     this.recentSends.set(this.sk(text), now);
     if (this.recentSends.size > 500) for (const [k, t] of this.recentSends) if (now - t > 300_000) this.recentSends.delete(k);
+  }
+  /** 统一的给候选人发消息:发前记一笔(用于回声识别),再真发。所有 AI→候选人的消息都走这里。 */
+  private async sendCandidate(chatId: string, text: string) {
+    if (!chatId || !text) return { ok: false, code: -97 } as any;
+    this.rememberSend(text);
     return this.miaohui.sendText(chatId, text);
+  }
+  private async sendCandidateByWecom(wecomUserId: string, externalUserId: string, text: string) {
+    if (!wecomUserId || !externalUserId || !text) return { ok: false, code: -97 } as any;
+    this.rememberSend(text);
+    return this.miaohui.sendTextByWecom(wecomUserId, externalUserId, text);
   }
   /** 这条 isSelf 消息是不是我们 AI 刚发的回声(5 分钟内发过一样的文本)。 */
   private isOurSend(text: string): boolean {
@@ -372,7 +422,8 @@ export class ReachService {
     else if (d?.sentStatus !== undefined) type = 'SENT_RESULT(发送结果)';
     else if (d?.externalUserId && d?.wxid && d?.phoneNum) type = 'FRIEND_CONFIRM(好友通过)';
     else if (isFriendSend) type = 'FRIEND_SEND(加好友结果)';
-    this.logger.log(`[mh回调·识别] 类型=${type} isSelf=${d?.isSelf} contactType=${d?.contactType} msgType=${d?.messageType ?? d?.type} contactId=${d?.contactId || ''} wxid=${d?.wxid || ''} chatId=${d?.chatId || ''} msgId=${d?.messageId || ''} 文本=${JSON.stringify(this.extractMsgText(d)).slice(0, 60)}`);
+    const previewText = d?.isSelf !== undefined && d?.contactId ? extractCandidateText(d) : this.extractMsgText(d);
+    this.logger.log(`[mh回调·识别] 类型=${type} isSelf=${d?.isSelf} contactType=${d?.contactType} msgType=${d?.messageType ?? d?.type} contactId=${d?.contactId || ''} wxid=${d?.wxid || ''} chatId=${d?.chatId || ''} msgId=${d?.messageId || ''} 文本=${JSON.stringify(previewText).slice(0, 60)}`);
     try {
       // 接收消息回调（候选人回复，data.isSelf + data.contactId）→ 服务主导对话（已弃用秒懂画布）
       if (d?.isSelf !== undefined && d?.contactId) return await this.onMessage(d, id);
@@ -412,8 +463,14 @@ export class ReachService {
     // isSelf=托管号自己发的:可能是 AI 的回声,也可能是真人 HR 在秒回工作台手动回了候选人。
     // 不是我们AI发的回声 → 真人回了 → 自动切转人工(玄玄需求13:00),之后 AI 闭嘴,取消转人工才恢复。
     if (d?.isSelf === true) {
-      const stext = this.extractMsgText(d);
+      const stext = extractCandidateText(d);
       if (stext && !this.isOurSend(stext) && !task.humanTakeover) await this.onHumanReply(task, stext);
+      return;
+    }
+    const text = extractCandidateText(d);
+    if (!text) {
+      this.logger.log(`[消息] ${task.name || task.phone} 非文本消息 type=${d?.messageType ?? d?.type}，忽略`);
+      await this.appendTimeline(task.taskId, 'MSG_SKIP_NON_TEXT', `type=${d?.messageType ?? d?.type}`);
       return;
     }
     if (!this.inWorkHours()) { this.logger.log('[工作时间外] 不聊天,消息暂不处理'); return; }
@@ -423,13 +480,10 @@ export class ReachService {
       await this.appendTimeline(task.taskId, 'MSG_SKIP_HANDOVER', '转人工中，候选人消息由真人处理');
       return;
     }
-    // 好友通过后首条消息 → 发欢迎语（这条通常是加好友打招呼回执，不当作候选人意图）
+    // 理论上好友通过回调已经主动发过；若仍在 CONFIRMED，先补发欢迎语，但不能吞掉候选人的真实消息。
     if (task.status === ReachStatus.CONFIRMED || task.status === ReachStatus.ADDING) {
       await this.sendWelcome(task);
-      return;
     }
-    const text = this.extractMsgText(d);
-    if (!text) return;
     // 防抖:不立即回;攒进缓冲,等 DEBOUNCE_MS 内候选人不再发,合并成一段再处理(治串行乱回)
     this.bufferMessage(task.taskId, text);
   }
@@ -457,20 +511,59 @@ export class ReachService {
     await this.handleReply(task, combined);
   }
 
-  /** 发带时间欢迎语（秒回 /message/send）。幂等:已发过直接返回;发送成功才推进 WELCOMED,
-   *  失败保持原状态,候选人开口后 onMessage 兜底补发。会话标识优先 chatId,回退 externalUserId/wxid。 */
-  private async sendWelcome(task: ReachTaskDocument) {
+  /** 好友通过后主动发带时间欢迎语。已有 chatId 直接发；没有则按 wecomUserId+externalUserId 主动发。
+   *  失败保持 CONFIRMED，由 sweepWelcomePending 重试，不依赖候选人先开口。 */
+  async sendWelcome(task: ReachTaskDocument): Promise<boolean> {
     if (task.status === ReachStatus.WELCOMED || task.status === ReachStatus.REPLIED
-        || task.status === ReachStatus.INTENT_ACCEPT) return; // 已进入后续阶段,不重复打招呼
-    const target = task.chatId || task.externalUserId || task.wxid;
-    if (!target) { this.logger.warn(`[欢迎语] task ${task.taskId} 无会话标识,等候选人开口再发`); return; }
-    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'), (task as any).round);
-    const r = await this.sendCandidate(target, welcome);
-    this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code} via=${task.chatId ? 'chatId' : 'extId'}`);
-    if (!r.ok) return; // 没发出去,保持 CONFIRMED,等 onMessage 兜底
-    task.status = ReachStatus.WELCOMED;
+        || task.status === ReachStatus.INTENT_ACCEPT) return true;
+    if (this.welcomeSending.has(task.taskId)) return false;
+    if ((task.welcomeAttempts || 0) >= 4) return false;
+    this.welcomeSending.add(task.taskId);
+    try {
+      const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'), (task as any).round);
+      task.welcomeAttempts = (task.welcomeAttempts || 0) + 1;
+      const r = task.chatId
+        ? await this.sendCandidate(task.chatId, welcome)
+        : await this.sendCandidateByWecom(task.hrBotUserId, task.externalUserId, welcome);
+      const requestId = r?.raw?.data?.requestId || r?.raw?.requestId || '';
+      this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code} via=${task.chatId ? 'chatId' : 'wecom'} attempt=${task.welcomeAttempts}`);
+      if (!r.ok) {
+        task.welcomeLastError = `code=${r.code} ${typeof r.raw === 'string' ? r.raw : JSON.stringify(r.raw || '')}`.slice(0, 200);
+        await task.save();
+        await this.appendTimeline(task.taskId, 'WELCOME_RETRY', `第${task.welcomeAttempts}次失败 ${task.welcomeLastError}`);
+        if (task.welcomeAttempts >= 4) await this.notifyWelcomeFailure(task);
+        return false;
+      }
+      task.status = ReachStatus.WELCOMED;
+      task.welcomeLastError = '';
+      task.welcomeRequestId = requestId;
+      task.welcomeSentAt = new Date();
+      await task.save();
+      await this.appendTimeline(task.taskId, 'WELCOMED', `已主动发带时间欢迎语 via=${task.chatId ? 'chatId' : 'wecom'} attempt=${task.welcomeAttempts}`);
+      return true;
+    } finally {
+      this.welcomeSending.delete(task.taskId);
+    }
+  }
+
+  /** 每10秒补偿好友通过后尚未发出的欢迎语；Mongo 状态保证服务重启后还能继续。 */
+  async sweepWelcomePending() {
+    const pending = await this.taskModel.find({
+      status: ReachStatus.CONFIRMED,
+      humanTakeover: { $ne: true },
+      $or: [{ welcomeAttempts: { $lt: 4 } }, { welcomeAttempts: { $exists: false } }],
+    }).limit(50).exec();
+    for (const task of pending) await this.sendWelcome(task);
+    if (pending.length) this.logger.log(`[欢迎语补偿] 待发${pending.length}条`);
+  }
+
+  private async notifyWelcomeFailure(task: ReachTaskDocument) {
+    if (task.welcomeFailureNotified) return;
+    task.welcomeFailureNotified = true;
     await task.save();
-    await this.appendTimeline(task.taskId, 'WELCOMED', '已发带时间欢迎语');
+    await this.appendTimeline(task.taskId, 'WELCOME_FAILED', `主动邀约连续${task.welcomeAttempts}次发送失败`);
+    await this.notifyHr(`⚠️【主动邀约发送失败】${task.name || task.phone} 好友已通过，但连续${task.welcomeAttempts}次未能发出面试邀约，请人工检查。`);
+    await this.backfillProgress(task, '好友已通过，但主动面试邀约连续发送失败，请人工检查', 'WELCOME_FAILED');
   }
 
   /** 候选人回复 → 大模型意图分类 → 回复 + 建日程 + 通知HR + 回填 */
@@ -482,7 +575,7 @@ export class ReachService {
     if (/不考虑|不来了|不面了|不去了|已入职|入职了|找到工作|算了不|放弃/.test(t)) return 'REJECT';
     const slot = extractTimeSlot(t);
     if (slot.date || slot.clock) return 'TIME';                 // 带具体时间→TIME,由 sameAsScheduled 分确认/改期
-    if (/^(可以|好的|好呀|好嘞|没问题|行|行的|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)/i.test(t)) return 'TIME';
+    if (isPureAcknowledgement(t)) return 'TIME';
     if (/不行|不方便|改期|改一下|改个时间|换时间|换个时间|调整.*时间|另约|时间.*不(合适|行)/.test(t)) return 'RESCHEDULE';
     return null;
   }
@@ -566,6 +659,11 @@ export class ReachService {
   }
 
   private async handleReply(task: ReachTaskDocument, text: string) {
+    if (shouldSuppressAcknowledgement(task.status, text)) {
+      this.logger.log(`[智能回复·静默] ${task.name || task.phone} 状态=${task.status} 纯确认「${text.slice(0, 30)}」`);
+      await this.appendTimeline(task.taskId, 'NO_REPLY_ACK', `状态=${task.status} 原话=${text.slice(0, 60)}`);
+      return;
+    }
     const ctx = this.buildContext(task);
     // 对话智能体开关:off=纯模板(现状)| shadow=模板照常服务+智能体只记录"它会怎么回"(验证用)| live=智能体真接管
     const agentMode = (this.config.get('REPLY_AGENT_MODE') || process.env.REPLY_AGENT_MODE || 'off').toString();
@@ -754,11 +852,13 @@ export class ReachService {
     task.wxid = body.wxid || task.wxid;
     task.externalUserId = body.externalUserId || body.externalUserid || task.externalUserId;
     if (body.chatId) task.chatId = body.chatId;
+    task.welcomeAttempts = 0;
+    task.welcomeLastError = '';
+    task.welcomeFailureNotified = false;
     await task.save();
     await this.appendTimeline(task.taskId, 'CONFIRMED', `好友通过 wxid=${task.wxid} extId=${task.externalUserId || '无'}`);
     this.logger.log(`[friend/confirm] ${task.name || task.phone} 好友已通过 extId=${task.externalUserId || '无'}`);
-    // 好友通过即主动发首条邀约,不等候选人先开口(玄玄需求)。发不出去(还没会话标识)时保持
-    // CONFIRMED,候选人开口后 onMessage 会兜底补发。
+    // 好友通过即主动发首条邀约；没有 chatId 时走 sendByWecom，不等候选人先开口。
     await this.sendWelcome(task);
   }
 
@@ -785,14 +885,25 @@ export class ReachService {
     if (!(await this.lock(key))) return;
     const task = await this.findTask(body);
     const who = task ? (task.name || task.phone) : (body.phoneNum || '某候选人');
+    if (task && body.chatId && task.chatId !== body.chatId) task.chatId = body.chatId;
+    const welcomeResult = !!task?.welcomeRequestId && task.welcomeRequestId === (body.requestId || body.externalRequestId);
     if (body.sentStatus === false) {
       if (task) {
+        if (welcomeResult) {
+          task.status = ReachStatus.CONFIRMED;
+          task.welcomeLastError = `异步发送失败 ${body.reason || body.errorCode || ''}`.trim();
+          await task.save();
+          await this.appendTimeline(task.taskId, 'WELCOME_DELIVERY_FAILED', task.welcomeLastError);
+          if ((task.welcomeAttempts || 0) >= 4) await this.notifyWelcomeFailure(task);
+          return;
+        }
         await this.appendTimeline(task.taskId, 'SEND_FAILED', `发消息失败 ${body.reason || ''}`);
         await this.requestHandover(task, 'SEND_FAILED', `给候选人发送消息失败 ${body.reason || ''}`);
       } else {
         await this.notifyHr(`⚠️【发送失败】给 ${who} 发送消息失败，请HR关注。`);
       }
     } else if (task) {
+      await task.save();
       await this.appendTimeline(task.taskId, 'SEND_OK', '消息已送达');
     }
   }
@@ -917,15 +1028,23 @@ export class ReachService {
   }
 
   // ───────────────────────── 公共：定位/通知/回填 ─────────────────────────
-  /** 按 extraInfo(taskId) 优先，回退 phone 定位任务 */
+  /** 按 taskId/phone/联系人/会话/欢迎语请求 id 定位任务 */
   private async findTask(body: any): Promise<ReachTaskDocument | null> {
     if (body?.extraInfo) {
       const t = await this.taskModel.findOne({ taskId: body.extraInfo }).exec();
       if (t) return t;
     }
     if (body?.phoneNum) {
-      return this.taskModel.findOne({ phone: body.phoneNum }).sort({ createdAt: -1 }).exec();
+      const t = await this.taskModel.findOne({ phone: body.phoneNum }).sort({ createdAt: -1 }).exec();
+      if (t) return t;
     }
+    const externalId = body?.externalUserId || body?.contactId;
+    const requestId = body?.requestId || body?.externalRequestId;
+    const ors: any[] = [];
+    if (externalId) ors.push({ externalUserId: externalId }, { wxid: externalId });
+    if (body?.chatId) ors.push({ chatId: body.chatId });
+    if (requestId) ors.push({ welcomeRequestId: requestId });
+    if (ors.length) return this.taskModel.findOne({ $or: ors }).sort({ createdAt: -1 }).exec();
     return null;
   }
 
