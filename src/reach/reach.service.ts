@@ -95,7 +95,7 @@ export function buildOpening(name?: string, position?: string, template?: string
  *  比 extractTime 宽:「周五下午」「明天」这类没钟点的也抓得到(改期收集要按槽位追问)。 */
 export function extractTimeSlot(text: string): { date?: string; part?: string; clock?: string; full: boolean; raw: string } {
   const t = (text || '').replace(/\s+/g, '');
-  const date = t.match(/(今天|明天|后天|大后天|下下?周[一二三四五六日天]|周[一二三四五六日天]|礼拜[一二三四五六日天]|\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号])/)?.[1];
+  const date = t.match(/(今天|明天|后天|大后天|下下?周[一二三四五六日天]|这周[一二三四五六日天]|周[一二三四五六日天]|礼拜[一二三四五六日天]|\d{1,2}月\d{1,2}[日号]|\d{1,2}[日号])/)?.[1];
   const part = t.match(/(上午|下午|中午|晚上|早上|傍晚)/)?.[1];
   const clock = extractTime(t);
   const raw = [date && !(clock || '').includes(date) ? date : '', part && !(clock || '').includes(part) ? part : '', clock].filter(Boolean).join('');
@@ -109,11 +109,11 @@ export function sameAsScheduled(slot: ReturnType<typeof extractTimeSlot>, interv
   const d = new Date(ms + 8 * 3600 * 1000);
   const days = ['日', '一', '二', '三', '四', '五', '六'];
   const sameDay = !slot.date
-    || slot.date === `周${days[d.getUTCDay()]}` || slot.date === `礼拜${days[d.getUTCDay()]}`
+    || slot.date === `周${days[d.getUTCDay()]}` || slot.date === `这周${days[d.getUTCDay()]}` || slot.date === `礼拜${days[d.getUTCDay()]}`
     || slot.date === `${d.getUTCMonth() + 1}月${d.getUTCDate()}日` || slot.date === `${d.getUTCMonth() + 1}月${d.getUTCDate()}号`;
   if (!sameDay) return false;
   if (slot.clock) {
-    const hh = parseInt(slot.clock.match(/(\d{1,2})[:：点时]/)?.[1] || '-1', 10);
+    const hh = parseInt(slot.clock.match(/(\d{1,2})[:：.。点时]/)?.[1] || '-1', 10);
     let sch = d.getUTCHours();
     const cand12 = hh < 12 && (slot.clock.includes('下午') || slot.clock.includes('晚上')) ? hh + 12 : hh;
     return cand12 === sch || hh === sch || (sch > 12 && hh === sch - 12);
@@ -134,9 +134,70 @@ export function isSafeAgentConfirm(text: string, interviewTimeRaw?: string): boo
   const t = (text || '').trim();
   if (!t) return false;
   const slot = extractTimeSlot(t);
-  const explicitAck = /^(可以|好的|好呀|好嘞|没问题|行|行的|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)/i.test(t);
+  // 只查开头不够:"行,我再想想""好的,那不来了""可以,那薪资多少"这类开头像确认、后半句语义反转/追问的话
+  // 会被单纯的前缀匹配误判成"明确应答"。改成:整句必须能被"确认词+语气助词/标点"完全铺满,不能带别的实质内容
+  // (允许"好的没问题"这类确认词连着说两遍)。
+  const ACK_TOKEN = '(?:可以|好的|好呀|好嘞|没问题|行的|行|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)';
+  const FILLER = '(?:[，,。.!！~～\\s呀啦哈哦噢的呢])';
+  const explicitAck = new RegExp(`^(?:${ACK_TOKEN}|${FILLER})+$`, 'i').test(t) && new RegExp(ACK_TOKEN, 'i').test(t);
   if (!explicitAck && !slot.date && !slot.clock) return false;
   return sameAsScheduled(slot, interviewTimeRaw);
+}
+
+/** 对话智能体只能在候选人原话确有"时间信号"或"改期意向词"时执行 propose_reschedule。
+ * 防模型从无关内容(如单纯致谢、答疑追问)里凭空捏造一个改期动作。 */
+export function isSafeAgentReschedule(text: string): boolean {
+  const t = (text || '').trim();
+  if (!t) return false;
+  const slot = extractTimeSlot(t);
+  if (slot.date || slot.clock || slot.part) return true;
+  return /改期|改约|改一下|改个时间|换时间|换个时间|调整.*时间|另约|不方便|不行|时间.*不(合适|行)|下周|这周|忙|没空|排班/.test(t);
+}
+
+/** 候选人原话是否带"不想来"的拒绝信号(不区分首次/再次,单纯做信号识别，与 quickIntent 的 REJECT 判据保持一致)。 */
+export function hasDeclineSignal(text: string): boolean {
+  return /不考虑|不来了|不面了|不去了|已入职|入职了|找到工作|算了不|放弃|不感兴趣|暂时不需要/.test((text || '').trim());
+}
+
+/** 秒回候选人文本消息固定为 type/messageType=7（兼容旧回调 0）。
+ * 图片等消息可能把 messageId 放在 payload.content，绝不能当候选人原话交给模型。 */
+export function extractCandidateText(d: any): string {
+  const type = d?.messageType ?? d?.type;
+  if (type !== undefined && ![0, 7, '0', '7'].includes(type)) return '';
+  if (typeof d?.text === 'string') return d.text.trim();
+  const p = d?.payload;
+  if (typeof p === 'string') return p.trim();
+  if (!p || typeof p !== 'object') return '';
+  const text = p.text ?? p.pureText;
+  return typeof text === 'string' ? text.trim() : '';
+}
+
+/** 只识别整句都是礼貌确认的消息；“好的，那薪资多少”有实质内容，不能静默。 */
+export function isPureAcknowledgement(text: string): boolean {
+  const raw = (text || '').toLowerCase();
+  if (/^[\s，,。.!！~～👌👍✅]+$/u.test(raw) && /[👌👍✅]/u.test(raw)) return true;
+  let rest = raw.replace(/[\p{P}\p{S}\s]/gu, '');
+  if (!rest) return false;
+  const tokens = [
+    '没有问题', '沒問題', '没问题', '明白了', '知道了', '辛苦了', '到时见',
+    '嗯嗯好的', '嗯好的', '好嘞', '好呀', '好的', '可以', '收到',
+    '谢谢啦', '谢谢', '感谢', '行的', '方便', '确认', '同意',
+    'okay', 'ok', '嗯嗯', '嗯', '好', '行',
+  ];
+  while (rest) {
+    const token = tokens.find((item) => rest.startsWith(item));
+    if (!token) return false;
+    rest = rest.slice(token.length);
+  }
+  return true;
+}
+
+/** 已经约成/已进入等待拍板/已经结束后，纯礼貌确认无需继续回复。 */
+export function shouldSuppressAcknowledgement(status: ReachStatus, text: string): boolean {
+  if (![ReachStatus.INTENT_ACCEPT, ReachStatus.INTENT_RESCHEDULE, ReachStatus.INTENT_REJECT].includes(status)) {
+    return false;
+  }
+  return isPureAcknowledgement(text);
 }
 
 /** 意图字符串 → 状态机取值（兼容中英文/画布回报） */
@@ -159,22 +220,47 @@ export class ReachService {
   // 防抖:候选人连发多条 → 攒几秒合并成一段再理解、只回一条连贯的(治"串行乱回")
   private readonly msgBuffer = new Map<string, { texts: string[]; timer: NodeJS.Timeout }>();
   private readonly DEBOUNCE_MS = 4000;
-  // 记下"我们(AI)发给候选人的消息文本",用于在 isSelf 回调时区分"AI 自己发的回声"vs"真人 HR 打的"→ 真人打的自动转人工。
-  // 按文本匹配(不带 chatId):宁可漏检真人(AI继续回,顶多多聊两句),也别误把 AI 回声当真人 → 误停 AI。
-  private readonly recentSends = new Map<string, number>();  // key=文本前60字, value=时间戳
+  private readonly welcomeSending = new Set<string>();
+  // 记下"AI 给哪位候选人发了什么",用于在 isSelf 回调时区分 AI 回声和真人 HR 主动消息。
+  // 必须带会话/候选人标识；只按文本匹配会把 HR 发给乙的话误认成 AI 刚发给甲的回声。
+  private readonly recentSends = new Map<string, number>();
   private sk(text: string) { return (text || '').trim().slice(0, 60); }
+  private sendKey(kind: 'chat' | 'ext', id: string, text: string) {
+    return `${kind}:${id}:${this.sk(text)}`;
+  }
+  private rememberSend(kind: 'chat' | 'ext', id: string, text: string) {
+    if (!id || !text) return;
+    const now = Date.now();
+    this.recentSends.set(this.sendKey(kind, id, text), now);
+    if (this.recentSends.size > 500) for (const [k, t] of this.recentSends) if (now - t > 300_000) this.recentSends.delete(k);
+  }
   /** 统一的给候选人发消息:发前记一笔(用于回声识别),再真发。所有 AI→候选人的消息都走这里。 */
   private async sendCandidate(chatId: string, text: string) {
     if (!chatId || !text) return { ok: false, code: -97 } as any;
-    const now = Date.now();
-    this.recentSends.set(this.sk(text), now);
-    if (this.recentSends.size > 500) for (const [k, t] of this.recentSends) if (now - t > 300_000) this.recentSends.delete(k);
+    this.rememberSend('chat', chatId, text);
     return this.miaohui.sendText(chatId, text);
   }
-  /** 这条 isSelf 消息是不是我们 AI 刚发的回声(5 分钟内发过一样的文本)。 */
-  private isOurSend(text: string): boolean {
-    const t = this.recentSends.get(this.sk(text));
-    return !!t && Date.now() - t < 300_000;
+  private async sendCandidateByWecom(wecomUserId: string, externalUserId: string, text: string) {
+    if (!wecomUserId || !externalUserId || !text) return { ok: false, code: -97 } as any;
+    this.rememberSend('ext', externalUserId, text);
+    return this.miaohui.sendTextByWecom(wecomUserId, externalUserId, text);
+  }
+  /** 这条 isSelf 消息是不是 AI 在 5 分钟内发给同一候选人的回声。 */
+  private isOurSend(task: ReachTaskDocument, d: any, text: string): boolean {
+    const keys = new Set<string>();
+    const add = (kind: 'chat' | 'ext', id: unknown) => {
+      const value = (id || '').toString().trim();
+      if (value) keys.add(this.sendKey(kind, value, text));
+    };
+    add('chat', d?.chatId);
+    add('chat', task.chatId);
+    add('ext', d?.externalUserId);
+    add('ext', task.externalUserId);
+    const now = Date.now();
+    return [...keys].some((key) => {
+      const sentAt = this.recentSends.get(key);
+      return !!sentAt && now - sentAt < 300_000;
+    });
   }
   private get dry() { return this.config.getBool('DRY_RUN', true); }
   private get PROG_APP() { return this.config.get('PROG_APP_TOKEN'); }
@@ -352,7 +438,8 @@ export class ReachService {
     else if (d?.sentStatus !== undefined) type = 'SENT_RESULT(发送结果)';
     else if (d?.externalUserId && d?.wxid && d?.phoneNum) type = 'FRIEND_CONFIRM(好友通过)';
     else if (isFriendSend) type = 'FRIEND_SEND(加好友结果)';
-    this.logger.log(`[mh回调·识别] 类型=${type} isSelf=${d?.isSelf} contactType=${d?.contactType} msgType=${d?.messageType ?? d?.type} contactId=${d?.contactId || ''} wxid=${d?.wxid || ''} chatId=${d?.chatId || ''} msgId=${d?.messageId || ''} 文本=${JSON.stringify(this.extractMsgText(d)).slice(0, 60)}`);
+    const previewText = d?.isSelf !== undefined && d?.contactId ? extractCandidateText(d) : this.extractMsgText(d);
+    this.logger.log(`[mh回调·识别] 类型=${type} isSelf=${d?.isSelf} contactType=${d?.contactType} msgType=${d?.messageType ?? d?.type} contactId=${d?.contactId || ''} wxid=${d?.wxid || ''} chatId=${d?.chatId || ''} msgId=${d?.messageId || ''} 文本=${JSON.stringify(previewText).slice(0, 60)}`);
     try {
       // 接收消息回调（候选人回复，data.isSelf + data.contactId）→ 服务主导对话（已弃用秒懂画布）
       if (d?.isSelf !== undefined && d?.contactId) return await this.onMessage(d, id);
@@ -392,8 +479,14 @@ export class ReachService {
     // isSelf=托管号自己发的:可能是 AI 的回声,也可能是真人 HR 在秒回工作台手动回了候选人。
     // 不是我们AI发的回声 → 真人回了 → 自动切转人工(玄玄需求13:00),之后 AI 闭嘴,取消转人工才恢复。
     if (d?.isSelf === true) {
-      const stext = this.extractMsgText(d);
-      if (stext && !this.isOurSend(stext) && !task.humanTakeover) await this.onHumanReply(task, stext);
+      const stext = extractCandidateText(d);
+      if (stext && !this.isOurSend(task, d, stext) && !task.humanTakeover) await this.onHumanReply(task, stext);
+      return;
+    }
+    const text = extractCandidateText(d);
+    if (!text) {
+      this.logger.log(`[消息] ${task.name || task.phone} 非文本消息 type=${d?.messageType ?? d?.type}，忽略`);
+      await this.appendTimeline(task.taskId, 'MSG_SKIP_NON_TEXT', `type=${d?.messageType ?? d?.type}`);
       return;
     }
     if (!this.inWorkHours()) { this.logger.log('[工作时间外] 不聊天,消息暂不处理'); return; }
@@ -403,13 +496,10 @@ export class ReachService {
       await this.appendTimeline(task.taskId, 'MSG_SKIP_HANDOVER', '转人工中，候选人消息由真人处理');
       return;
     }
-    // 好友通过后首条消息 → 发欢迎语（这条通常是加好友打招呼回执，不当作候选人意图）
+    // 理论上好友通过回调已经主动发过；若仍在 CONFIRMED，先补发欢迎语，但不能吞掉候选人的真实消息。
     if (task.status === ReachStatus.CONFIRMED || task.status === ReachStatus.ADDING) {
       await this.sendWelcome(task);
-      return;
     }
-    const text = this.extractMsgText(d);
-    if (!text) return;
     // 防抖:不立即回;攒进缓冲,等 DEBOUNCE_MS 内候选人不再发,合并成一段再处理(治串行乱回)
     this.bufferMessage(task.taskId, text);
   }
@@ -437,20 +527,59 @@ export class ReachService {
     await this.handleReply(task, combined);
   }
 
-  /** 发带时间欢迎语（秒回 /message/send）。幂等:已发过直接返回;发送成功才推进 WELCOMED,
-   *  失败保持原状态,候选人开口后 onMessage 兜底补发。会话标识优先 chatId,回退 externalUserId/wxid。 */
-  private async sendWelcome(task: ReachTaskDocument) {
+  /** 好友通过后主动发带时间欢迎语。已有 chatId 直接发；没有则按 wecomUserId+externalUserId 主动发。
+   *  失败保持 CONFIRMED，由 sweepWelcomePending 重试，不依赖候选人先开口。 */
+  async sendWelcome(task: ReachTaskDocument): Promise<boolean> {
     if (task.status === ReachStatus.WELCOMED || task.status === ReachStatus.REPLIED
-        || task.status === ReachStatus.INTENT_ACCEPT) return; // 已进入后续阶段,不重复打招呼
-    const target = task.chatId || task.externalUserId || task.wxid;
-    if (!target) { this.logger.warn(`[欢迎语] task ${task.taskId} 无会话标识,等候选人开口再发`); return; }
-    const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'), (task as any).round);
-    const r = await this.sendCandidate(target, welcome);
-    this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code} via=${task.chatId ? 'chatId' : 'extId'}`);
-    if (!r.ok) return; // 没发出去,保持 CONFIRMED,等 onMessage 兜底
-    task.status = ReachStatus.WELCOMED;
+        || task.status === ReachStatus.INTENT_ACCEPT) return true;
+    if (this.welcomeSending.has(task.taskId)) return false;
+    if ((task.welcomeAttempts || 0) >= 4) return false;
+    this.welcomeSending.add(task.taskId);
+    try {
+      const welcome = buildInviteMessage(task.name, task.position, task.interviewTime, this.config.get('WELCOME_TEMPLATE'), (task as any).round);
+      task.welcomeAttempts = (task.welcomeAttempts || 0) + 1;
+      const r = task.chatId
+        ? await this.sendCandidate(task.chatId, welcome)
+        : await this.sendCandidateByWecom(task.hrBotUserId, task.externalUserId, welcome);
+      const requestId = r?.raw?.data?.requestId || r?.raw?.requestId || '';
+      this.logger.log(`[欢迎语] ${task.name || task.phone} ok=${r.ok} code=${r.code} via=${task.chatId ? 'chatId' : 'wecom'} attempt=${task.welcomeAttempts}`);
+      if (!r.ok) {
+        task.welcomeLastError = `code=${r.code} ${typeof r.raw === 'string' ? r.raw : JSON.stringify(r.raw || '')}`.slice(0, 200);
+        await task.save();
+        await this.appendTimeline(task.taskId, 'WELCOME_RETRY', `第${task.welcomeAttempts}次失败 ${task.welcomeLastError}`);
+        if (task.welcomeAttempts >= 4) await this.notifyWelcomeFailure(task);
+        return false;
+      }
+      task.status = ReachStatus.WELCOMED;
+      task.welcomeLastError = '';
+      task.welcomeRequestId = requestId;
+      task.welcomeSentAt = new Date();
+      await task.save();
+      await this.appendTimeline(task.taskId, 'WELCOMED', `已主动发带时间欢迎语 via=${task.chatId ? 'chatId' : 'wecom'} attempt=${task.welcomeAttempts}`);
+      return true;
+    } finally {
+      this.welcomeSending.delete(task.taskId);
+    }
+  }
+
+  /** 每10秒补偿好友通过后尚未发出的欢迎语；Mongo 状态保证服务重启后还能继续。 */
+  async sweepWelcomePending() {
+    const pending = await this.taskModel.find({
+      status: ReachStatus.CONFIRMED,
+      humanTakeover: { $ne: true },
+      $or: [{ welcomeAttempts: { $lt: 4 } }, { welcomeAttempts: { $exists: false } }],
+    }).limit(50).exec();
+    for (const task of pending) await this.sendWelcome(task);
+    if (pending.length) this.logger.log(`[欢迎语补偿] 待发${pending.length}条`);
+  }
+
+  private async notifyWelcomeFailure(task: ReachTaskDocument) {
+    if (task.welcomeFailureNotified) return;
+    task.welcomeFailureNotified = true;
     await task.save();
-    await this.appendTimeline(task.taskId, 'WELCOMED', '已发带时间欢迎语');
+    await this.appendTimeline(task.taskId, 'WELCOME_FAILED', `主动邀约连续${task.welcomeAttempts}次发送失败`);
+    await this.notifyHr(`⚠️【主动邀约发送失败】${task.name || task.phone} 好友已通过，但连续${task.welcomeAttempts}次未能发出面试邀约，请人工检查。`);
+    await this.backfillProgress(task, '好友已通过，但主动面试邀约连续发送失败，请人工检查', 'WELCOME_FAILED');
   }
 
   /** 候选人回复 → 大模型意图分类 → 回复 + 建日程 + 通知HR + 回填 */
@@ -462,7 +591,7 @@ export class ReachService {
     if (/不考虑|不来了|不面了|不去了|已入职|入职了|找到工作|算了不|放弃/.test(t)) return 'REJECT';
     const slot = extractTimeSlot(t);
     if (slot.date || slot.clock) return 'TIME';                 // 带具体时间→TIME,由 sameAsScheduled 分确认/改期
-    if (/^(可以|好的|好呀|好嘞|没问题|行|行的|ok|方便|确认|同意|没有问题|嗯好|👌|沒問題)/i.test(t)) return 'TIME';
+    if (isPureAcknowledgement(t)) return 'TIME';
     if (/不行|不方便|改期|改一下|改个时间|换时间|换个时间|调整.*时间|另约|时间.*不(合适|行)/.test(t)) return 'RESCHEDULE';
     return null;
   }
@@ -474,24 +603,29 @@ export class ReachService {
     try { await task.save(); } catch { /* 历史非关键,并发保存冲突忽略 */ }
   }
 
-  /** 真人 HR 在秒回工作台手动回了候选人(检测到非 AI 回声的 isSelf 消息)→ 自动转人工(玄玄需求13:00)。
+  /** 真人 HR 在秒回工作台主动发起或回复候选人(检测到非 AI 回声的 isSelf 消息)→ 自动转人工。
    *  之后 AI 一律不接待候选人消息;HR 在进度表取消【转人工】勾选 → rule5 同步回来恢复 AI。 */
   private async onHumanReply(task: ReachTaskDocument, humanText: string) {
     task.humanTakeover = true;
     task.status = ReachStatus.HANDOVER;
     await task.save();
     await this.recordHistory(task, 'ai', `[真人HR] ${humanText}`);
-    this.logger.log(`[真人接入] ${task.name || task.phone} HR手动回复「${humanText.slice(0, 40)}」→ 自动转人工`);
-    await this.requestHandover(task, 'HUMAN_REPLY', `HR 在秒回工作台手动回复了候选人,自动转人工`, humanText);
-    await this.backfillProgress(task, '检测到真人 HR 回复,自动转人工', 'HANDOVER');
+    this.logger.log(`[真人接入] ${task.name || task.phone} HR主动发消息「${humanText.slice(0, 40)}」→ 自动转人工`);
+    await this.requestHandover(task, 'HUMAN_REPLY', 'HR 在秒回工作台主动发起或回复会话，自动转人工', humanText);
+    await this.backfillProgress(task, '检测到真人 HR 主动发起或回复会话，自动转人工', 'HANDOVER');
   }
 
   /** live 模式:智能体接管——先发它生成的回复,再按它判定的 action 走"已验证的关键动作"(动作由代码执行+校验,模型只提议)。 */
-  private async executeAgentTurn(task: ReachTaskDocument, text: string, agent: { reply: string; action: string; time: string }) {
+  private async executeAgentTurn(task: ReachTaskDocument, text: string, agent: { reply: string; action: string; time: string; confidence: number }) {
     const who = task.name || task.phone;
     if (task.chatId && agent.reply) await this.sendCandidate(task.chatId, agent.reply);
     await this.recordHistory(task, 'ai', agent.reply);
-    this.logger.log(`[智能体·真跑] ${who} 回「${agent.reply.slice(0, 50)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''}`);
+    this.logger.log(`[智能体·真跑] ${who} 回「${agent.reply.slice(0, 50)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''} 把握度:${agent.confidence}`);
+    // 候选人这轮流露拒绝信号、且不是执行 reject_close 本身 → 记一笔"已问过一次"，
+    // 供下一轮 reject_close 的确定性校验放行(实现"先挽留问原因,再拒才关闭"的两步规格，即使全程走智能体也不失效)。
+    if (agent.action !== 'reject_close' && hasDeclineSignal(text) && !task.rejectAsked) {
+      task.rejectAsked = true;
+    }
     switch (agent.action) {
       case 'confirm':
         task.status = ReachStatus.INTENT_ACCEPT;
@@ -534,10 +668,18 @@ export class ReachService {
       [ReachStatus.INTENT_RESCHEDULE]: '候选人要改期,正在对时间',
     };
     parts.push(`当前状态：${statusMap[task.status] || '沟通中'}`);
+    // 显式告知"已经问过一次拒绝原因"这个状态，别指望模型自己从历史里推断——
+    // 防抖合并/历史只留最近10轮时，这个关键状态容易被稀释掉，导致反复重复同一句"方便说下原因吗"。
+    if (task.rejectAsked) parts.push('已经问过候选人一次婉拒原因；如果候选人这轮再次明确拒绝，就是真的不来了，可以直接回应告别');
     return `【对话背景】${parts.join('；')}。`;
   }
 
   private async handleReply(task: ReachTaskDocument, text: string) {
+    if (shouldSuppressAcknowledgement(task.status, text)) {
+      this.logger.log(`[智能回复·静默] ${task.name || task.phone} 状态=${task.status} 纯确认「${text.slice(0, 30)}」`);
+      await this.appendTimeline(task.taskId, 'NO_REPLY_ACK', `状态=${task.status} 原话=${text.slice(0, 60)}`);
+      return;
+    }
     const ctx = this.buildContext(task);
     // 对话智能体开关:off=纯模板(现状)| shadow=模板照常服务+智能体只记录"它会怎么回"(验证用)| live=智能体真接管
     const agentMode = (this.config.get('REPLY_AGENT_MODE') || process.env.REPLY_AGENT_MODE || 'off').toString();
@@ -545,12 +687,20 @@ export class ReachService {
       const agent = await this.llm.agentTurn({ context: ctx, history: (task.history || []).map((h) => ({ role: h.role, text: h.text })), message: text });
       if (agent) {
         if (agentMode === 'live') {
-          if (agent.action !== 'confirm' || isSafeAgentConfirm(text, task.interviewTime)) {
+          // 关键动作(约成/改期/拒绝关闭)各自的确定性校验：模型只"提议"，代码校验候选人原话确实支持这个动作才放行；
+          // 校验不过 → 整轮回退到下面的确定性模板流程(quickIntent/classifyIntent)，不部分执行模型的判断。
+          // handover 不设硬拦截(转人工的风险是"多打扰HR一次"，远小于"该转没转"，宁可放宽)。
+          const safe =
+            agent.action === 'confirm' ? isSafeAgentConfirm(text, task.interviewTime) :
+            agent.action === 'propose_reschedule' ? isSafeAgentReschedule(text) :
+            agent.action === 'reject_close' ? task.rejectAsked === true :
+            true;
+          if (safe) {
             return await this.executeAgentTurn(task, text, agent);
           }
-          this.logger.warn(`[智能体·动作拦截] ${task.name || task.phone} 模型误判 confirm，回退确定性流程：${text.slice(0, 60)}`);
+          this.logger.warn(`[智能体·动作拦截] ${task.name || task.phone} 模型误判 ${agent.action}(把握度${agent.confidence})，回退确定性流程：${text.slice(0, 60)}`);
         }
-        this.logger.log(`[智能体·影子] ${task.name || task.phone} 候选人「${text.replace(/\n/g, ' ').slice(0, 50)}」→ 模型会回「${agent.reply.slice(0, 60)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''}`);
+        this.logger.log(`[智能体·影子] ${task.name || task.phone} 候选人「${text.replace(/\n/g, ' ').slice(0, 50)}」→ 模型会回「${agent.reply.slice(0, 60)}」动作:${agent.action}${agent.time ? ' time:' + agent.time : ''} 把握度:${agent.confidence}`);
       }
       // agent 为 null(解析失败) → 回退下面的模板流程
     }
@@ -718,11 +868,13 @@ export class ReachService {
     task.wxid = body.wxid || task.wxid;
     task.externalUserId = body.externalUserId || body.externalUserid || task.externalUserId;
     if (body.chatId) task.chatId = body.chatId;
+    task.welcomeAttempts = 0;
+    task.welcomeLastError = '';
+    task.welcomeFailureNotified = false;
     await task.save();
     await this.appendTimeline(task.taskId, 'CONFIRMED', `好友通过 wxid=${task.wxid} extId=${task.externalUserId || '无'}`);
     this.logger.log(`[friend/confirm] ${task.name || task.phone} 好友已通过 extId=${task.externalUserId || '无'}`);
-    // 好友通过即主动发首条邀约,不等候选人先开口(玄玄需求)。发不出去(还没会话标识)时保持
-    // CONFIRMED,候选人开口后 onMessage 会兜底补发。
+    // 好友通过即主动发首条邀约；没有 chatId 时走 sendByWecom，不等候选人先开口。
     await this.sendWelcome(task);
   }
 
@@ -749,14 +901,25 @@ export class ReachService {
     if (!(await this.lock(key))) return;
     const task = await this.findTask(body);
     const who = task ? (task.name || task.phone) : (body.phoneNum || '某候选人');
+    if (task && body.chatId && task.chatId !== body.chatId) task.chatId = body.chatId;
+    const welcomeResult = !!task?.welcomeRequestId && task.welcomeRequestId === (body.requestId || body.externalRequestId);
     if (body.sentStatus === false) {
       if (task) {
+        if (welcomeResult) {
+          task.status = ReachStatus.CONFIRMED;
+          task.welcomeLastError = `异步发送失败 ${body.reason || body.errorCode || ''}`.trim();
+          await task.save();
+          await this.appendTimeline(task.taskId, 'WELCOME_DELIVERY_FAILED', task.welcomeLastError);
+          if ((task.welcomeAttempts || 0) >= 4) await this.notifyWelcomeFailure(task);
+          return;
+        }
         await this.appendTimeline(task.taskId, 'SEND_FAILED', `发消息失败 ${body.reason || ''}`);
         await this.requestHandover(task, 'SEND_FAILED', `给候选人发送消息失败 ${body.reason || ''}`);
       } else {
         await this.notifyHr(`⚠️【发送失败】给 ${who} 发送消息失败，请HR关注。`);
       }
     } else if (task) {
+      await task.save();
       await this.appendTimeline(task.taskId, 'SEND_OK', '消息已送达');
     }
   }
@@ -881,15 +1044,23 @@ export class ReachService {
   }
 
   // ───────────────────────── 公共：定位/通知/回填 ─────────────────────────
-  /** 按 extraInfo(taskId) 优先，回退 phone 定位任务 */
+  /** 按 taskId/phone/联系人/会话/欢迎语请求 id 定位任务 */
   private async findTask(body: any): Promise<ReachTaskDocument | null> {
     if (body?.extraInfo) {
       const t = await this.taskModel.findOne({ taskId: body.extraInfo }).exec();
       if (t) return t;
     }
     if (body?.phoneNum) {
-      return this.taskModel.findOne({ phone: body.phoneNum }).sort({ createdAt: -1 }).exec();
+      const t = await this.taskModel.findOne({ phone: body.phoneNum }).sort({ createdAt: -1 }).exec();
+      if (t) return t;
     }
+    const externalId = body?.externalUserId || body?.contactId;
+    const requestId = body?.requestId || body?.externalRequestId;
+    const ors: any[] = [];
+    if (externalId) ors.push({ externalUserId: externalId }, { wxid: externalId });
+    if (body?.chatId) ors.push({ chatId: body.chatId });
+    if (requestId) ors.push({ welcomeRequestId: requestId });
+    if (ors.length) return this.taskModel.findOne({ $or: ors }).sort({ createdAt: -1 }).exec();
     return null;
   }
 

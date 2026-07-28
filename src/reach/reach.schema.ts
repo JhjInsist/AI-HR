@@ -65,6 +65,21 @@ export class ReachTask {
   @Prop()
   chatId: string;                      // 发消息寻址用
 
+  @Prop({ default: 0 })
+  welcomeAttempts: number;             // 好友通过后主动邀约发送尝试次数
+
+  @Prop()
+  welcomeLastError: string;            // 最近一次主动邀约失败原因
+
+  @Prop()
+  welcomeRequestId: string;            // 秒回发送请求 id（关联异步发送结果）
+
+  @Prop()
+  welcomeSentAt: Date;                 // 主动邀约接口受理时间
+
+  @Prop({ default: false })
+  welcomeFailureNotified: boolean;     // 多次失败只通知 HR 一次
+
   @Prop({ default: '一面' })
   round: string;                       // 面试轮次:一面/二面/三面(话术按轮次说话)
 

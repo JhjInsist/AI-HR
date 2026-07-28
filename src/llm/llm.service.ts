@@ -187,38 +187,90 @@ export class LlmService {
       '结合【对话背景】(候选人应聘岗位/已约时间/当前状态)回答，别答非所问、别和已定的事实矛盾。\n' +
       '只有涉及公司机密、需要公司层面承诺(如口头offer、入职条件)、或你确实没法得体回答时，才说"这个我帮您问下同事再回复您"。\n' +
       '【知识库】\n' + kb +
-      '\n要求：口语化、简短(1-2句)、礼貌热情。若候选人还没确认面试时间，答完必须自然把话题拉回确认面试时间。直接输出要发给候选人的话，不要任何JSON、标签、前后缀。';
+      '\n要求：像真人同事聊天，不要每次都用一样的开头(别总是"收到~")；口语化、简短(1-2句)、礼貌热情。若候选人还没确认面试时间，答完必须自然把话题拉回确认面试时间。直接输出要发给候选人的话，不要任何JSON、标签、前后缀。';
     const content = context ? `${context}\n\n【候选人问】${text}` : text;
     const r = await this.completion({ system, messages: [{ role: 'user', content }], temperature: 0.3, maxTokens: 300 });
     return r.message || '这个我帮您问下同事再回复您哈~';
   }
 
-  /** 对话智能体:一次调用看全上下文(背景+历史+知识库+最新消息),产出 {回复, 动作, 时间}。
-   *  关键动作(约成/改期/转人工)只"提议",由 reach.service 代码执行+校验,模型放飞也乱不了。
-   *  解析失败返回 null → 调用方回退安全模板流程。 */
+  /** 对话智能体 system prompt（独立导出，测试脚本要复用同一份，避免测试和线上口径漂移）。 */
+  buildAgentSystemPrompt(kb: string): string {
+    return (
+      '你是句子互动的招聘助理，在企业微信上和候选人聊天，核心目标是拿到候选人确认的面试时间。\n\n' +
+      '【怎么说话】\n' +
+      '- 像真人招聘同事发消息，不是机器人播报。简短(1-2句，最多3句)、口语化、有温度，不要每次都用一样的开头(别总是"收到~")。\n' +
+      '- 贴着候选人的语气来：候选人正式你就正式一点，候选人随意你也可以随意一点，但始终礼貌。\n' +
+      '- emoji 少而精，别堆。\n\n' +
+      '【怎么判断】\n' +
+      '根据【对话背景】【对话历史】【知识库】读懂候选人【最新消息】(可能连发几句已合并给你)，回一句得体的话，并判断该触发什么动作。\n\n' +
+      '硬规则(必须遵守，任何情况不可违反)：\n' +
+      '① 绝不擅自定/改面试时间。候选人给了新时间，只能说"我跟面试官确认下"，动作=propose_reschedule，time 填候选人期望时间原文，由面试官拍板，不算约定。\n' +
+      '② 薪资/待遇一律"面议、面试细聊"，不报数字、不承诺任何金额或范围。\n' +
+      '③ 不编造公司信息、不承诺面试结果/offer。知识库没有且拿不准的，说"这个我帮您问下同事"，动作=none。\n' +
+      '④ 候选人第一次流露不想来的意思(比如"不太考虑了"/"暂时不需要")→ 先挽留问原因，动作=none，别直接判定拒绝；候选人在你问过原因后【再次】明确说不来了，才是真正拒绝，动作=reject_close。\n' +
+      '⑤ 候选人明确要求转真人/人工客服 → handover。\n\n' +
+      'action 只能选一个：\n' +
+      '- confirm：候选人明确确认了背景里【已约时间】(不是给了个新时间，是认同当前这个时间)\n' +
+      '- propose_reschedule：候选人给了不同于已约时间的新时间/时间段，或明确想改期。time 填候选人期望时间原文\n' +
+      '- handover：需要真人接手\n' +
+      '- reject_close：候选人已经被问过一次原因后，再次明确拒绝\n' +
+      '- none：其余情况——答疑、闲聊、引导候选人给出具体时间、追问模糊的时间表达等，都不触发动作\n\n' +
+      '【知识库】\n' + kb + '\n\n' +
+      '【几个例子(体会语气和判断，不要照抄措辞)】\n' +
+      '候选人："周三下午方便吗"（背景：已约时间=周四10:00）\n' +
+      '→ {"reply":"周三下午可以，我跟面试官确认下时间，定了马上告诉您~","action":"propose_reschedule","time":"周三下午","confidence":0.9}\n\n' +
+      '候选人："好的没问题"（背景：已约时间=周四10:00）\n' +
+      '→ {"reply":"好嘞，那面试时间就是周四10点啦，到时候见~","action":"confirm","time":"","confidence":0.95}\n\n' +
+      '候选人："这个岗位薪资大概多少啊"\n' +
+      '→ {"reply":"薪资是面议的哈，面试聊得好都好谈，具体到面试环节可以和面试官细聊~","action":"none","time":"","confidence":0.9}\n\n' +
+      '候选人："我最近不太想面试了，谢谢"\n' +
+      '→ {"reply":"啊好的，方便说下是为什么吗？如果是时间的原因咱们可以再约，别的顾虑也可以跟我说说，我看看能不能帮上~","action":"none","time":"","confidence":0.85}\n\n' +
+      '候选人(在被问过原因后)："还是算了吧，不去了"\n' +
+      '→ {"reply":"好的，完全理解，感谢您的关注，之后有更合适的机会我再联系您，祝一切顺利！","action":"reject_close","time":"","confidence":0.9}\n\n' +
+      '候选人："能不能让你们人来跟我聊，别用AI了"\n' +
+      '→ {"reply":"好的，我让招聘同事直接联系您，稍等一下下~","action":"handover","time":"","confidence":0.95}\n\n' +
+      '严格只输出 JSON，不要任何前后缀、不要 markdown 代码块：\n' +
+      '{"reply":"发给候选人的话","action":"confirm|propose_reschedule|handover|reject_close|none","time":"候选人期望时间原文或空","confidence":0到1之间的数字,表示你对这次判断的把握程度}'
+    );
+  }
+
+  /** 对话智能体:一次调用看全上下文(背景+历史+知识库+最新消息),产出 {回复, 动作, 时间, 把握度}。
+   *  关键动作(约成/改期/转人工/拒绝)只"提议",由 reach.service 代码执行+校验,模型放飞也乱不了。
+   *  解析失败重试一次(严格JSON指令);仍失败返回 null → 调用方回退安全模板流程。 */
   async agentTurn(input: { context: string; history: { role: string; text: string }[]; message: string }):
-    Promise<{ reply: string; action: string; time: string } | null> {
+    Promise<{ reply: string; action: string; time: string; confidence: number } | null> {
     const kb = await this.loadKb();
-    const system =
-      '你是句子互动的招聘助理,在企业微信上和候选人聊天,核心目标是拿到候选人确认的面试时间。\n' +
-      '根据【对话背景】【对话历史】【知识库】读懂候选人【最新消息】(可能连发几句已合并给你),回一句得体、像真人、简短(1-2句)的话,并判断该触发什么动作。\n' +
-      '硬规则(必须遵守):\n' +
-      '① 绝不擅自定/改面试时间。候选人给了新时间,只能说"我跟面试官确认下",动作=propose_reschedule,由面试官拍板。\n' +
-      '② 薪资一律"面议、面试细聊",不报数字、不承诺。③ 不编造公司信息,知识库没有且不好答的说"这个我帮您问下同事"。\n' +
-      '④ 明确要真人→handover;首次婉拒→先挽留问原因(action=none),再次明确拒绝→reject_close。\n' +
-      'action 只能选一个:confirm(候选人明确确认了背景里【已约时间】)| propose_reschedule(给了不同时间/想改,time填其期望时间原文)| handover | reject_close | none(答疑/闲聊/引导,不触发动作)。\n' +
-      '【知识库】\n' + kb + '\n' +
-      '严格只输出 JSON,不要任何前后缀:{"reply":"发给候选人的话","action":"confirm|propose_reschedule|handover|reject_close|none","time":"候选人期望时间原文或空"}';
+    const system = this.buildAgentSystemPrompt(kb);
     const hist = (input.history || []).slice(-8).map((h) => `${h.role === 'ai' ? '我' : '候选人'}：${h.text}`).join('\n');
     const user = `${input.context}\n【对话历史】\n${hist || '(无)'}\n【最新消息】${input.message}`;
-    try {
-      const r = await this.completion({ system, messages: [{ role: 'user', content: user }], temperature: 0.3, maxTokens: 400 });
-      const m = (r.message || '').match(/\{[\s\S]*\}/);
+    const parse = (raw: string) => {
+      const m = (raw || '').match(/\{[\s\S]*\}/);
       if (!m) return null;
       const j = JSON.parse(m[0]);
       if (!j.reply || !j.action) return null;
       const okActions = ['confirm', 'propose_reschedule', 'handover', 'reject_close', 'none'];
-      return { reply: String(j.reply), action: okActions.includes(j.action) ? j.action : 'none', time: String(j.time || '') };
+      const conf = Number(j.confidence);
+      return {
+        reply: String(j.reply),
+        action: okActions.includes(j.action) ? j.action : 'none',
+        time: String(j.time || ''),
+        confidence: isNaN(conf) ? 0.5 : Math.max(0, Math.min(1, conf)),
+      };
+    };
+    try {
+      const r = await this.completion({ system, messages: [{ role: 'user', content: user }], temperature: 0.3, maxTokens: 400 });
+      const parsed = parse(r.message);
+      if (parsed) return parsed;
+      this.logger.warn(`agentTurn JSON 解析失败，重试一次: ${(r.message || '').slice(0, 80)}`);
+      const retry = await this.completion({
+        system,
+        messages: [{ role: 'user', content: user }, { role: 'assistant', content: r.message }, { role: 'user', content: '你上一条没有输出合法 JSON。严格只输出 JSON，不要 markdown 代码块、不要任何解释文字。' }],
+        temperature: 0, maxTokens: 400,
+      });
+      const parsedRetry = parse(retry.message);
+      if (parsedRetry) return parsedRetry;
+      this.logger.warn(`agentTurn 重试仍解析失败(回退模板): ${(retry.message || '').slice(0, 80)}`);
+      return null;
     } catch (e: any) {
       this.logger.warn(`agentTurn 失败(回退模板): ${e?.message}`);
       return null;
