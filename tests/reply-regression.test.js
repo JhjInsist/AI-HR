@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const fs = require('node:fs');
 const {
   ReachService,
   extractCandidateText,
@@ -59,6 +60,13 @@ function makeService(sendByWecom, taskForQueries = null) {
 }
 
 async function main() {
+  const feishuSource = fs.readFileSync(require.resolve('../dist/feishu/feishu.service'), 'utf8');
+  assert.match(
+    feishuSource,
+    /attendee_ability:\s*['"]can_modify_event['"]/,
+    '秒聘创建的日程必须允许面试官编辑',
+  );
+
   assert.equal(
     extractCandidateText({ type: 11, payload: { content: 'b1dca371c502a2bf66850630dad8ffa2' } }),
     '',

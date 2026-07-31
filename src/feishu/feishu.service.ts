@@ -140,7 +140,8 @@ export class FeishuService {
           auto_record: true,
         },
       },
-      attendee_ability: 'can_see_others',
+      // 面试官需要能直接调整时间、描述和参与人，避免机器人建会后只能查看。
+      attendee_ability: 'can_modify_event',
       need_notification: true,
       reminders: [{ minutes: 15 }],
     });
