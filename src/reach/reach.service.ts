@@ -386,6 +386,14 @@ export class ReachService {
     if (busy) {
       return { ok: false, conflict: true, msg: `面试官「${interviewer || '未知'}」该时间已有日程，未通知候选人` };
     }
+    // 先移动已有日程，确认日历写入成功后再通知候选人，避免两边时间不一致。
+    if (task.scheduleEventId) {
+      const moved = await this.feishu.updateInterviewEventTime(task.scheduleEventId, start, start + 30 * 60 * 1000);
+      if (!moved) {
+        await this.appendTimeline(task.taskId, 'SCHEDULE_MOVE_FAIL', `日程改到 ${formatInterviewTimeText(interviewTime)} 失败，未通知候选人`);
+        return { ok: false, calendarUpdateFailed: true, msg: '面试官日历更新失败，未通知候选人' };
+      }
+    }
     const timeText = formatInterviewTimeText(interviewTime);
     const text = `${task.name || '您'}您好~ 跟您同步一下：您的${rd}面试时间调整为【${timeText}】。方便的话回复「可以」确认；如有冲突，回复您方便的时间就好~`;
     const r = await this.sendCandidate(task.chatId, text);
@@ -393,11 +401,7 @@ export class ReachService {
     task.interviewTime = interviewTime;
     task.round = rd;
     task.status = ReachStatus.WELCOMED;  // 回到"已发邀约待确认"态,候选人回复走原意图链
-    // 已建过日程的:同步移动日历日程到新时间(玄玄需求:面试官同意后同步更新日历日程)
-    if (task.scheduleEventId) {
-      const moved = await this.feishu.updateInterviewEventTime(task.scheduleEventId, start, start + 30 * 60 * 1000);
-      await this.appendTimeline(task.taskId, moved ? 'SCHEDULE_MOVED' : 'SCHEDULE_MOVE_FAIL', `日程改到 ${timeText}`);
-    }
+    if (task.scheduleEventId) await this.appendTimeline(task.taskId, 'SCHEDULE_MOVED', `日程改到 ${timeText}`);
     await task.save();
     await this.appendTimeline(task.taskId, 'RESCHEDULE_NOTIFY', `已推送${rd}改期:${timeText}`);
     this.logger.log(`[改期直推] ${task.name || task.phone} ${rd}→${timeText}`);
