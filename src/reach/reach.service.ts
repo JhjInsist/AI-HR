@@ -371,8 +371,21 @@ export class ReachService {
     let task = dataId ? await this.taskModel.findOne({ dataId }).sort({ createdAt: -1 }).exec() : null;
     if (!task && phone) task = await this.taskModel.findOne({ phone }).sort({ createdAt: -1 }).exec();
     if (!task) return { ok: false, msg: '找不到触达任务' };
-    if (!task.chatId) return { ok: false, msg: '候选人未绑定会话(还没聊过),无法直发,请退回重触达' };
+    if (!task.chatId) return { ok: false, retryReach: true, msg: '候选人未绑定会话(还没聊过),无法直发,请退回重触达' };
     const rd = round || task.round || '一面';
+    const start = parseInterviewTime(interviewTime);
+    if (start == null) return { ok: false, msg: '新面试时间无法解析，未通知候选人' };
+    const { openId: interviewerOpenId, interviewer } = await this.resolveHr(task);
+    if (!interviewerOpenId) {
+      return { ok: false, calendarCheckFailed: true, msg: `无法识别面试官「${interviewer || '未知'}」的飞书身份，未通知候选人` };
+    }
+    const busy = await this.feishu.isUserBusy(interviewerOpenId, start, start + 30 * 60 * 1000);
+    if (busy === null) {
+      return { ok: false, calendarCheckFailed: true, msg: '无法读取面试官日历忙闲，未通知候选人' };
+    }
+    if (busy) {
+      return { ok: false, conflict: true, msg: `面试官「${interviewer || '未知'}」该时间已有日程，未通知候选人` };
+    }
     const timeText = formatInterviewTimeText(interviewTime);
     const text = `${task.name || '您'}您好~ 跟您同步一下：您的${rd}面试时间调整为【${timeText}】。方便的话回复「可以」确认；如有冲突，回复您方便的时间就好~`;
     const r = await this.sendCandidate(task.chatId, text);
@@ -382,11 +395,8 @@ export class ReachService {
     task.status = ReachStatus.WELCOMED;  // 回到"已发邀约待确认"态,候选人回复走原意图链
     // 已建过日程的:同步移动日历日程到新时间(玄玄需求:面试官同意后同步更新日历日程)
     if (task.scheduleEventId) {
-      const start = parseInterviewTime(interviewTime);
-      if (start != null) {
-        const moved = await this.feishu.updateInterviewEventTime(task.scheduleEventId, start, start + 30 * 60 * 1000);
-        await this.appendTimeline(task.taskId, moved ? 'SCHEDULE_MOVED' : 'SCHEDULE_MOVE_FAIL', `日程改到 ${timeText}`);
-      }
+      const moved = await this.feishu.updateInterviewEventTime(task.scheduleEventId, start, start + 30 * 60 * 1000);
+      await this.appendTimeline(task.taskId, moved ? 'SCHEDULE_MOVED' : 'SCHEDULE_MOVE_FAIL', `日程改到 ${timeText}`);
     }
     await task.save();
     await this.appendTimeline(task.taskId, 'RESCHEDULE_NOTIFY', `已推送${rd}改期:${timeText}`);

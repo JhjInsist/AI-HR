@@ -10,6 +10,7 @@ const {
   isSafeAgentReschedule,
   shouldSuppressAcknowledgement,
 } = require('../dist/reach/reach.service');
+const { FeishuService } = require('../dist/feishu/feishu.service');
 const { ReachStatus } = require('../dist/reach/reach.schema');
 const { MiaohuiService } = require('../dist/miaohui/miaohui.service');
 
@@ -65,6 +66,16 @@ async function main() {
     feishuSource,
     /attendee_ability:\s*['"]can_modify_event['"]/,
     '秒聘创建的日程必须允许面试官编辑',
+  );
+
+  const calendar = new FeishuService();
+  calendar.req = async () => ({
+    freebusy_list: [{ busy_time_list: [{ start_time: '2026-08-06T10:00:00+08:00', end_time: '2026-08-06T11:00:00+08:00' }] }],
+  });
+  assert.equal(
+    await calendar.isUserBusy('ou-interviewer', Date.parse('2026-08-06T10:30:00+08:00'), Date.parse('2026-08-06T11:00:00+08:00')),
+    true,
+    '改期必须能识别面试官已有忙碌日程',
   );
 
   assert.equal(

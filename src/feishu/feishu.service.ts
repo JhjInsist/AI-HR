@@ -194,6 +194,35 @@ export class FeishuService {
     }
   }
 
+  /** 检查用户主日历在指定时间段是否忙碌。返回 null 表示无法完成校验。 */
+  async isUserBusy(userId: string, startTime: number, endTime: number): Promise<boolean | null> {
+    if (!userId || !Number.isFinite(startTime) || !Number.isFinite(endTime)) return null;
+    try {
+      const d = await this.req(
+        'POST',
+        '/open-apis/calendar/v4/freebusy/batch',
+        {
+          time_min: new Date(startTime).toISOString(),
+          time_max: new Date(endTime).toISOString(),
+          user_ids: [userId],
+          only_busy: true,
+          include_external_calendar: true,
+        },
+        { user_id_type: 'open_id' },
+      );
+      const item = (d?.freebusy_list || d?.busy_time_list || [])[0] || d || {};
+      const slots = item.busy_time_list || item.busy_times || d?.busy_time_list || [];
+      return slots.some((slot: any) => {
+        const start = Date.parse(slot.start_time || slot.start || '');
+        const end = Date.parse(slot.end_time || slot.end || '');
+        return Number.isFinite(start) && Number.isFinite(end) && start < endTime && end > startTime;
+      });
+    } catch (e: any) {
+      this.logger.warn(`[改期]查询面试官忙闲失败: ${e?.message}`);
+      return null;
+    }
+  }
+
   /** 下载某记录某附件字段的文件到本地目录，返回文件路径数组 */
   async downloadAttachments(appToken: string, tableId: string, recordId: string, field: string, dir: string): Promise<string[]> {
     // 附件 file_token 在记录字段里；下载走 drive media
