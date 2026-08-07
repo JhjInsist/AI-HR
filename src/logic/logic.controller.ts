@@ -1,8 +1,10 @@
-import { Controller, Get, Post, Body, Query } from '@nestjs/common';
+import { Controller, Get, Post, Body, Query, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { ConfigService } from '../config/config.service';
 import { ConverseService } from '../recruit/converse.service';
 import { MiaohuiService } from '../miaohui/miaohui.service';
 import { ReachService } from '../reach/reach.service';
+import { SIDEBAR_HTML } from './sidebar.page';
 
 /**
  * 逻辑层辅助 API（已去表格化，不碰飞书多维表格）。
@@ -42,6 +44,63 @@ export class LogicController {
     const p = (phone || '').trim();
     if (!p) return { found: false, msg: '缺少 phone' };
     return this.reachSvc.getCandidateInfo(p, externalId);
+  }
+
+  /**
+   * 侧边栏候选人卡片（纯读，无副作用）：
+   * GET /logic/candidate-card?externalUserId=[&wxid=&chatId=&phone=]
+   * 聚合聊天侧边栏按会话上下文的任一标识命中，返回姓名/岗位/面试官/轮次/状态/时间线等。
+   * 与 candidate-info 区分：此接口绝不推进状态机、不发欢迎语、不写库。
+   */
+  @Get('candidate-card')
+  async candidateCard(
+    @Query('externalUserId') externalUserId?: string,
+    @Query('wxid') wxid?: string,
+    @Query('chatId') chatId?: string,
+    @Query('phone') phone?: string,
+  ) {
+    return this.reachSvc.getCandidateCard({ externalUserId, wxid, chatId, phone });
+  }
+
+  /**
+   * 聚合聊天侧边栏页面：GET /logic/sidebar
+   * 注册到「企业控制台 → 配置中心 → 工具栏配置」。建议 URL 带 msgType=postMessage
+   * 走 JS-SDK 版（能拿到 externalUserId，命中率最高，且切会话时宿主会推 updateBaseInfo）。
+   */
+  @Get('sidebar')
+  sidebarPage(@Res() res: Response) {
+    // 禁用缓存：同 admin 配置台，避免 iframe 用旧 JS（相对 fetch 路径 bug 曾因此复现）
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.type('html').send(SIDEBAR_HTML);
+  }
+
+  /**
+   * 简历附件代理：GET /logic/candidate-resume?dataId=[&phone=]
+   * 表格服务的 /candidate/resume 要求 X-AIHR-Token 头，浏览器 <a href> 带不了，
+   * 故由本服务代理转发（token 只留在服务端）。侧边栏卡片的 resumeUrl 指向这里。
+   */
+  @Get('candidate-resume')
+  async candidateResume(
+    @Res() res: Response,
+    @Query('dataId') dataId?: string,
+    @Query('phone') phone?: string,
+  ) {
+    const r = await this.reachSvc.getCandidateResume({ dataId, phone });
+    if (!r) {
+      res.status(404).json({ ok: false, msg: '无简历附件或表格服务不可用' });
+      return;
+    }
+    // 简历不一定是 PDF（也有 docx），按扩展名给类型，未知则交给浏览器下载
+    const ext = (r.name.match(/\.([a-z0-9]+)$/i)?.[1] || '').toLowerCase();
+    const mime = {
+      pdf: 'application/pdf',
+      doc: 'application/msword',
+      docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+    }[ext] || 'application/octet-stream';
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(r.name)}`);
+    res.send(r.data);
   }
 
   /** 意图回报（兼容旧画布链路）：POST /logic/report-intent {externalId|contactId|phone, intent, slots?} */

@@ -295,6 +295,109 @@ export class ReachService {
     ).exec();
   }
 
+  /**
+   * 按任一标识查触达任务(纯读,零副作用)。externalUserId/wxid/chatId/phone 传哪个查哪个,
+   * 多个则 $or。全空返回 null(不查库)。取最新一条。
+   * 侧边栏卡片与画布链路共用此查询,但副作用只在各自调用方内做。
+   */
+  private async findTaskByAnyId(ids: {
+    externalUserId?: string; wxid?: string; chatId?: string; phone?: string;
+  }): Promise<ReachTaskDocument | null> {
+    const or: Record<string, string>[] = [];
+    const ext = (ids.externalUserId || '').trim();
+    const wxid = (ids.wxid || '').trim();
+    const chatId = (ids.chatId || '').trim();
+    const phone = (ids.phone || '').trim();
+    if (ext) or.push({ externalUserId: ext });
+    if (wxid) or.push({ wxid });
+    if (chatId) or.push({ chatId });
+    if (phone) or.push({ phone });
+    if (!or.length) return null;
+    return this.taskModel.findOne({ $or: or }).sort({ createdAt: -1 }).exec();
+  }
+
+  /** task → 侧边栏展示卡片(纯映射,不生成欢迎语、不触碰状态机)。 */
+  private toCandidateCard(task: ReachTaskDocument) {
+    return {
+      found: true,
+      taskId: task.taskId,
+      dataId: task.dataId,
+      name: task.name,
+      position: task.position,
+      interviewer: task.interviewer,
+      round: task.round,
+      status: task.status,
+      interviewTime: task.interviewTime,
+      meetingLink: task.meetingLink,
+      evalDoc: task.evalDoc,
+      humanTakeover: task.humanTakeover,
+      phone: task.phone,
+      timeline: task.timeline || [],
+    };
+  }
+
+  /**
+   * 侧边栏查候选人进度卡片(纯读)。聚合聊天侧边栏按 externalUserId/wxid/chatId 之一命中。
+   * 与 getCandidateInfo 严格区分:此方法绝不改状态、不 save、不写 timeline。
+   */
+  async getCandidateCard(ids: {
+    externalUserId?: string; wxid?: string; chatId?: string; phone?: string;
+  }): Promise<{ found: boolean; [k: string]: any }> {
+    const task = await this.findTaskByAnyId(ids);
+    if (!task) return { found: false };            // 未命中就不白调表格服务
+    const card = this.toCandidateCard(task);
+    const extra = await this.fetchProgressFields(task);
+    // mongo(触达进度引擎)是姓名/岗位/面试官/状态的事实源,表格只补 mongo 没有的字段;
+    // 唯一重叠的 evalDoc 做空值补位(mongo 还没写面评链接时用表格里的)。
+    return { ...card, ...extra, evalDoc: card.evalDoc || extra.evalDoc || '' };
+  }
+
+  /**
+   * 从表格服务补进度表字段(候选人身份/岗位大类/渠道/简历筛选/备忘录/逐字稿/简历附件)。
+   * 只显式取 mongo 没有的字段,不整体合并——避免表格里的姓名/手机号覆盖进度引擎的事实源。
+   * 永不抛:表格服务未配置/超时/500 一律降级返回 {},卡片主体(mongo 字段)照常可用。
+   */
+  private async fetchProgressFields(task: ReachTaskDocument): Promise<Record<string, any>> {
+    const fn = (this.table as any)?.getCandidate;
+    if (typeof fn !== 'function') return {};       // 老版本 client / 未注入
+    try {
+      const r = await this.table.getCandidate({ dataId: task.dataId, phone: task.phone });
+      if (!r) return {};
+      const out: Record<string, any> = {
+        identity: r.identity,
+        positionCategory: r.positionCategory,
+        channel: r.channel,
+        screening: r.screening,
+        memo: r.memo,
+        transcript: r.transcript,
+        evalDoc: r.evalDoc,
+        hasResume: !!r.hasResume,
+        resumeName: r.resumeName || '',
+        // 简历必须走自家代理:表格服务要 X-AIHR-Token 头,浏览器 <a href> 带不了。
+        // dataId/phone 都带上——dataId 可能为空(靠手机号匹配的记录),只带 dataId 会 404。
+        resumeUrl: r.hasResume ? `/logic/candidate-resume?${new URLSearchParams({
+          dataId: task.dataId || '', phone: task.phone || '',
+        }).toString()}` : '',
+      };
+      return out;
+    } catch (e: any) {
+      this.logger.warn(`补进度表字段失败(降级) ${task.taskId}: ${e?.message}`);
+      return {};
+    }
+  }
+
+  /** 简历附件字节(侧边栏点开简历时经 miaopin 代理下载)。失败返回 null。 */
+  async getCandidateResume(ids: { dataId?: string; phone?: string }) {
+    const fn = (this.table as any)?.getResume;
+    if (typeof fn !== 'function') return null;
+    try {
+      return await this.table.getResume(ids);
+    } catch (e: any) {
+      this.logger.warn(`取简历失败 ${ids.dataId || ids.phone || ''}: ${e?.message}`);
+      return null;
+    }
+  }
+
   // ───────────────────────── ① 发起触达 ─────────────────────────
   /** 建任务(ADDING) → 秒回加好友(extraInfo=taskId, userId=hrBotUserId) → 记 timeline */
   async createTask(dto: CreateReachDto) {
@@ -944,7 +1047,8 @@ export class ReachService {
    * externalId：画布传来的 wecomContactId/externalUserId，存入任务作关联键，供后续意图回报匹配。
    */
   async getCandidateInfo(phone: string, externalId?: string): Promise<{ found: boolean; name?: string; position?: string; interviewTime?: string; welcome?: string }> {
-    const task = await this.taskModel.findOne({ phone: (phone || '').trim() }).sort({ createdAt: -1 }).exec();
+    // 按 phone 查(行为同原实现:externalId 仅作关联键回填,不参与查询)
+    const task = await this.findTaskByAnyId({ phone });
     if (!task) return { found: false };
     let dirty = false;
     // 关联键：画布带来的 contactId 存下，后面 report-intent 按它匹配任务（秒回回调缺失时的兜底）
