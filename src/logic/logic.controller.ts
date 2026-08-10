@@ -1,9 +1,10 @@
-import { Controller, Get, Post, Body, Query, Res } from '@nestjs/common';
+import { Controller, Get, Post, Body, Query, Res, Headers, UnauthorizedException } from '@nestjs/common';
 import type { Response } from 'express';
 import { ConfigService } from '../config/config.service';
 import { ConverseService } from '../recruit/converse.service';
 import { MiaohuiService } from '../miaohui/miaohui.service';
 import { ReachService } from '../reach/reach.service';
+import { SidebarAuthService } from './sidebar-auth.service';
 import { SIDEBAR_HTML } from './sidebar.page';
 
 /**
@@ -17,6 +18,7 @@ export class LogicController {
     private readonly converse: ConverseService,
     private readonly miaohui: MiaohuiService,
     private readonly reachSvc: ReachService,
+    private readonly sidebarAuth: SidebarAuthService,
   ) {}
 
   /** 发起纯加好友：POST /logic/reach {phone, name?, helloMsg?}（不建任务、不走编排，仅加好友） */
@@ -54,12 +56,33 @@ export class LogicController {
    */
   @Get('candidate-card')
   async candidateCard(
+    @Headers('x-sidebar-session') session?: string,
     @Query('externalUserId') externalUserId?: string,
     @Query('wxid') wxid?: string,
     @Query('chatId') chatId?: string,
     @Query('phone') phone?: string,
   ) {
+    // 返回手机号/时间线,必须持有本服务签发的会话(未配置鉴权时 verify 恒 false → fail closed)
+    if (!this.sidebarAuth.verify(session)) {
+      throw new UnauthorizedException('侧边栏会话无效或已过期');
+    }
     return this.reachSvc.getCandidateCard({ externalUserId, wxid, chatId, phone });
+  }
+
+  /**
+   * 建侧边栏会话：POST /logic/sidebar-session {code}
+   * code 是宿主签发的一次性 OAuth code（只有登录态聚合聊天能取得）。**服务端**拿它去 BFF
+   * 换身份，校验 orgId 白名单后签发本服务的短时会话令牌；共享密钥不下发浏览器。
+   * code 在 identity-service 侧是原子一次性消费，故只在建会话时换一次。
+   */
+  @Post('sidebar-session')
+  async sidebarSession(@Res() res: Response, @Body() body?: { code?: string }) {
+    const r = await this.sidebarAuth.createSession(body?.code);
+    if (!r) {
+      res.status(401).json({ ok: false, msg: '身份校验失败：code 无效/已过期，或侧边栏鉴权未配置' });
+      return;
+    }
+    res.json({ ok: true, token: r.token, expiresIn: r.expiresIn });
   }
 
   /**
@@ -82,9 +105,15 @@ export class LogicController {
   @Get('candidate-resume')
   async candidateResume(
     @Res() res: Response,
+    @Headers('x-sidebar-session') session?: string,
     @Query('dataId') dataId?: string,
     @Query('phone') phone?: string,
   ) {
+    // 同 candidate-card：下载简历必须持有会话。页面侧用 fetch+blob 带头请求，不把令牌塞 URL。
+    if (!this.sidebarAuth.verify(session)) {
+      res.status(401).json({ ok: false, msg: '侧边栏会话无效或已过期' });
+      return;
+    }
     const r = await this.reachSvc.getCandidateResume({ dataId, phone });
     if (!r) {
       res.status(404).json({ ok: false, msg: '无简历附件或表格服务不可用' });

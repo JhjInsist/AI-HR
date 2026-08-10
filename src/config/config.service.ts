@@ -27,6 +27,8 @@ export class ConfigService implements OnModuleInit {
     'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION',
     'KNOWLEDGE_BASE', 'WELCOME_TEMPLATE', 'OPENING_TEMPLATE',
     'TABLE_SERVICE_URL', 'AIHR_TABLE_TOKEN', 'REPLY_AGENT_MODE',
+    // 侧边栏入口鉴权:前两项缺一则侧边栏接口一律 401(fail-closed)
+    'SIDEBAR_BFF_BASE', 'SIDEBAR_SESSION_SECRET', 'SIDEBAR_ORG_WHITELIST', 'SIDEBAR_SESSION_TTL_SEC',
   ];
 
   constructor(

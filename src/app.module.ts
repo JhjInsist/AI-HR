@@ -18,6 +18,7 @@ import { HrMapping, HrMappingSchema } from './hr/hr.schema';
 import { HrService } from './hr/hr.service';
 import { LlmService } from './llm/llm.service';
 import { TableService } from './table/table.service';
+import { SidebarAuthService } from './logic/sidebar-auth.service';
 
 // ioredis provider（触达编排幂等锁）：lazyConnect 首连失败不崩，锁异常时放行不阻断业务
 const redisProvider = {
@@ -42,7 +43,7 @@ const redisProvider = {
   providers: [
     ConfigService, FeishuService, MiaohuiService,
     ConverseService, InsightAdminService,
-    ReachService, HrService, LlmService, TableService, redisProvider,
+    ReachService, HrService, LlmService, TableService, SidebarAuthService, redisProvider,
   ],
 })
 export class AppModule {}

@@ -25,10 +25,21 @@ function query(result) {
  * 造 service。model 捕获 findOne 的 filter、save 次数、timeline 推入,用于断言无副作用。
  * @param {object|null} task 命中的任务(null 表示查不到)
  */
+/**
+ * 造 service。
+ * @param task 单个任务(任何查询都命中它),或任务数组(按 filter 的字段值精确匹配 —— 冲突场景要用这个,
+ *             否则无论查哪个标识都返回同一条,测不出"不同标识命中不同候选人")
+ */
 function makeService(task, tableStub) {
   const calls = { findOneFilters: [], timelinePushes: [], resumeQueries: [] };
+  const pool = Array.isArray(task) ? task : null;
+  const pick = (filter) => {
+    if (!pool) return task;
+    const keys = Object.keys(filter || {});
+    return pool.find((t) => keys.every((k) => t[k] === filter[k])) || null;
+  };
   const model = {
-    findOne(filter) { calls.findOneFilters.push(filter); return query(task); },
+    findOne(filter) { calls.findOneFilters.push(filter); return query(pick(filter)); },
     find: () => query([]),
     updateOne: (_filter, update) => ({
       exec: async () => { if (update?.$push?.timeline) calls.timelinePushes.push(update.$push.timeline); },
@@ -95,10 +106,10 @@ async function main() {
     assert.equal(task.__savedCount(), 0, '1: 不得调用 save');
     assert.equal(calls.timelinePushes.length, 0, '1: 不得写 timeline');
 
-    // findOne 用 $or 且包含 externalUserId 条件
+    // 按可信度优先级单键定位(不再用 $or 混查,见 review #2 与测试 18-24)
     const f = calls.findOneFilters[0];
-    assert.ok(f && Array.isArray(f.$or), '1: 应以 $or 查询');
-    assert.ok(f.$or.some((c) => c.externalUserId === 'wm-zhangsan'), '1: $or 含 externalUserId 条件');
+    assert.ok(!f.$or, '1: 不应使用 $or 混查');
+    assert.equal(f.externalUserId, 'wm-zhangsan', '1: 首选 externalUserId 单键定位');
   }
 
   // ── 测试2:查不到返回 found:false ──
@@ -108,15 +119,15 @@ async function main() {
     assert.deepEqual(card, { found: false }, '2: 查不到返回 {found:false}');
   }
 
-  // ── 测试3:wxid / chatId / phone 任一键都能构造查询 ──
+  // ── 测试3:无 externalUserId 时按优先级降级用 wxid 定位,且仍能命中 ──
   {
     const task = baseTask();
     const { service, calls } = makeService(task);
-    await service.getCandidateCard({ wxid: 'wx-zhangsan', chatId: 'chat-1', phone: '13800000000' });
+    const card = await service.getCandidateCard({ wxid: 'wx-zhangsan', chatId: 'chat-1', phone: '13800000000' });
     const f = calls.findOneFilters[0];
-    assert.ok(f.$or.some((c) => c.wxid === 'wx-zhangsan'), '3: $or 含 wxid');
-    assert.ok(f.$or.some((c) => c.chatId === 'chat-1'), '3: $or 含 chatId');
-    assert.ok(f.$or.some((c) => c.phone === '13800000000'), '3: $or 含 phone');
+    assert.ok(!f.$or, '3: 不应使用 $or 混查');
+    assert.equal(f.wxid, 'wx-zhangsan', '3: 缺 externalUserId 时次选 wxid');
+    assert.equal(card.found, true, '3: 仍能命中');
   }
 
   // ── 测试3b:全空入参返回 found:false,且不查库 ──
@@ -137,6 +148,85 @@ async function main() {
     assert.equal(task.status, ReachStatus.WELCOMED, '4: 仍把 CONFIRMED 推进到 WELCOMED');
     assert.ok(task.__savedCount() > 0, '4: 仍会 save');
     assert.ok(calls.timelinePushes.some((t) => t.event === 'WELCOMED'), '4: 仍写 WELCOMED 时间线');
+  }
+
+  // ══════════ 标识优先级与冲突 fail-closed(玄玄 review #2) ══════════
+  // 背景:聚合聊天侧边栏切会话时会残留上一会话的 chatId(迭代100 修过这个 bug)。
+  // 原实现把所有标识塞进 $or 后按 createdAt 取最新 —— 不同标识分别命中不同候选人时,
+  // 会展示"较新的那个错误候选人",连带泄露其简历。故改为:优先级取最可信标识,
+  // 其余非空标识必须指向同一任务,冲突则拒绝。
+
+  const A = () => baseTask({ taskId: 'RT-A', name: '甲', dataId: 'rec-A',
+    externalUserId: 'wm-A', wxid: 'wx-A', chatId: 'chat-A', phone: '13800000001' });
+  const B = () => baseTask({ taskId: 'RT-B', name: '乙', dataId: 'rec-B',
+    externalUserId: 'wm-B', wxid: 'wx-B', chatId: 'chat-B', phone: '13800000002' });
+
+  // ── 18:externalUserId 与残留 chatId 指向不同人 → 拒绝,绝不展示任一方 ──
+  {
+    const { service } = makeService([A(), B()]);
+    const card = await service.getCandidateCard({ externalUserId: 'wm-A', chatId: 'chat-B' });
+    assert.equal(card.found, false, '18: 标识冲突必须 fail closed');
+    assert.notEqual(card.name, '乙', '18: 绝不能展示错误候选人');
+    assert.notEqual(card.name, '甲', '18: 冲突时连正确的也不给(宁缺勿错)');
+  }
+
+  // ── 19:externalUserId 优先于 wxid/chatId(都指向同一人时正常返回) ──
+  {
+    const { service } = makeService([A(), B()]);
+    const card = await service.getCandidateCard({ externalUserId: 'wm-A', wxid: 'wx-A', chatId: 'chat-A' });
+    assert.equal(card.found, true, '19: 全部标识一致应命中');
+    assert.equal(card.name, '甲', '19: 命中正确候选人');
+  }
+
+  // ── 20:externalUserId 最可信 —— 优先用它查,而不是别的键 ──
+  {
+    const { service, calls } = makeService([A(), B()]);
+    await service.getCandidateCard({ chatId: 'chat-A', wxid: 'wx-A', externalUserId: 'wm-A' });
+    const f0 = calls.findOneFilters[0];
+    assert.ok(!f0.$or, '20: 不应再用 $or 混查');
+    assert.equal(f0.externalUserId, 'wm-A', '20: 首选 externalUserId 定位');
+  }
+
+  // ── 21:phone 与 externalUserId 冲突也要拒绝 ──
+  {
+    const { service } = makeService([A(), B()]);
+    const card = await service.getCandidateCard({ externalUserId: 'wm-A', phone: '13800000002' });
+    assert.equal(card.found, false, '21: phone 指向他人 → 拒绝');
+  }
+
+  // ── 22:任务上该字段为空时不算冲突(chatId 是懒填充的,空≠矛盾) ──
+  {
+    const t = A(); t.chatId = '';
+    const { service } = makeService([t]);
+    const card = await service.getCandidateCard({ externalUserId: 'wm-A', chatId: 'chat-new' });
+    assert.equal(card.found, true, '22: 任务 chatId 为空时不应误判冲突');
+    assert.equal(card.name, '甲', '22: 正常返回');
+  }
+
+  // ── 23:主键查不到时按优先级降级(未加好友的候选人只有 chatId) ──
+  {
+    const t = A(); t.externalUserId = '';
+    const { service } = makeService([t]);
+    const card = await service.getCandidateCard({ externalUserId: 'wm-unknown', chatId: 'chat-A' });
+    assert.equal(card.found, true, '23: 主键无命中应降级用次级标识');
+    assert.equal(card.name, '甲', '23: 命中正确候选人');
+  }
+
+  // ── 24:全部标识都查不到 → found:false ──
+  {
+    const { service } = makeService([A(), B()]);
+    const card = await service.getCandidateCard({ externalUserId: 'wm-x', chatId: 'chat-y' });
+    assert.equal(card.found, false, '24: 都查不到返回 found:false');
+  }
+
+  // ── 25(回归):getCandidateInfo 单键(phone)调用行为不受影响 ──
+  {
+    const t = A(); t.status = ReachStatus.CONFIRMED;
+    const { service, calls } = makeService([t]);
+    const r = await service.getCandidateInfo('13800000001', 'wm-A');
+    assert.equal(r.found, true, '25: 画布链路仍能按 phone 命中');
+    assert.equal(t.status, ReachStatus.WELCOMED, '25: 副作用仍保留');
+    assert.ok(calls.timelinePushes.some((x) => x.event === 'WELCOMED'), '25: 仍写 WELCOMED');
   }
 
   // ══════════ 第二步:合并表格服务(进度表)字段 ══════════

@@ -295,25 +295,48 @@ export class ReachService {
     ).exec();
   }
 
+  /** 标识可信度排序:企微外部联系人ID 最稳,chatId 最易残留(切会话时宿主可能带上一会话的) */
+  private static readonly ID_PRIORITY = ['externalUserId', 'wxid', 'chatId', 'phone'] as const;
+
   /**
-   * 按任一标识查触达任务(纯读,零副作用)。externalUserId/wxid/chatId/phone 传哪个查哪个,
-   * 多个则 $or。全空返回 null(不查库)。取最新一条。
-   * 侧边栏卡片与画布链路共用此查询,但副作用只在各自调用方内做。
+   * 按标识查触达任务(纯读,零副作用)。
+   *
+   * 不用 $or 混查:聚合聊天侧边栏切会话时会残留上一会话的 chatId(迭代100 修过该 bug),
+   * 若把多个标识塞进 $or 再按 createdAt 取最新,不同标识分别命中不同候选人时会展示
+   * "较新的那个错误候选人",并连带泄露其简历。
+   *
+   * 改为:① 按可信度优先级逐个单键定位,命中即止;② 命中后校验其余非空标识是否指向同一任务,
+   * 任一矛盾则拒绝(fail closed,宁缺勿错)。任务侧字段为空不算矛盾(chatId 等是懒填充的)。
    */
   private async findTaskByAnyId(ids: {
     externalUserId?: string; wxid?: string; chatId?: string; phone?: string;
   }): Promise<ReachTaskDocument | null> {
-    const or: Record<string, string>[] = [];
-    const ext = (ids.externalUserId || '').trim();
-    const wxid = (ids.wxid || '').trim();
-    const chatId = (ids.chatId || '').trim();
-    const phone = (ids.phone || '').trim();
-    if (ext) or.push({ externalUserId: ext });
-    if (wxid) or.push({ wxid });
-    if (chatId) or.push({ chatId });
-    if (phone) or.push({ phone });
-    if (!or.length) return null;
-    return this.taskModel.findOne({ $or: or }).sort({ createdAt: -1 }).exec();
+    const given: Record<string, string> = {};
+    for (const k of ReachService.ID_PRIORITY) {
+      const v = ((ids as Record<string, string | undefined>)[k] || '').toString().trim();
+      if (v) given[k] = v;
+    }
+    if (!Object.keys(given).length) return null;      // 全空:不查库
+
+    for (const key of ReachService.ID_PRIORITY) {
+      if (!given[key]) continue;
+      const task = await this.taskModel.findOne({ [key]: given[key] }).sort({ createdAt: -1 }).exec();
+      if (!task) continue;                            // 该标识无命中 → 降级试下一个
+      const conflict = Object.keys(given).find((other) => {
+        if (other === key) return false;
+        const own = ((task as unknown as Record<string, string>)[other] || '').toString().trim();
+        return own && own !== given[other];           // 两边都非空且不等 → 指向了不同的人
+      });
+      if (conflict) {
+        this.logger.warn(
+          `[标识冲突] 拒绝返回候选人:按 ${key}=${given[key]} 命中 ${task.taskId},`
+          + `但 ${conflict}=${given[conflict]} 与其 ${conflict} 不一致(疑似切会话残留标识)`,
+        );
+        return null;
+      }
+      return task;
+    }
+    return null;
   }
 
   /** task → 侧边栏展示卡片(纯映射,不生成欢迎语、不触碰状态机)。 */

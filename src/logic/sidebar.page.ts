@@ -45,6 +45,9 @@ a{color:var(--acc)}
 (function(){
   var app = document.getElementById('app');
   var reqSeq = 0, pending = {}, lastKey = '';
+  // 会话令牌只放内存变量：不落 localStorage/sessionStorage，页面一关即失效
+  var sessionToken = null;
+  var lastCode = '';            // 宿主签发的一次性 OAuth code（用掉即弃）
 
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
@@ -74,32 +77,70 @@ a{color:var(--acc)}
   }, false);
 
   // ── 收集候选人标识 ──
+  // 注意：服务端对标识做了冲突校验（切会话时宿主可能残留上一会话的 chatId，见 review #2），
+  // 所以拿到最可信的 externalUserId 后就**只发它**，不要把可能过期的 chatId 一起带上。
   async function ids(){
     var q = qs(), out = {};
+    if (q.code) lastCode = q.code;                    // 普通版：OAuth 回调把 code 带在 URL 上
     // 直接指定（便于脱离聚合聊天单独验证：/logic/sidebar?phone=138xxxx）
     ['externalUserId','wxid','chatId','phone'].forEach(function(k){ if (q[k]) out[k] = q[k]; });
-    if (out.externalUserId || out.phone) return out;   // 显式指定则不再问宿主
+    if (out.externalUserId) return { externalUserId: out.externalUserId };
+    if (out.phone) return out;
     // 普通版：URL 里有 juziChatId / juziChatWxid（无 externalUserId）
     if (q.juziChatId)   out.chatId = q.juziChatId;
     if (q.juziChatWxid) out.wxid   = q.juziChatWxid;
-    // JS-SDK 版：先 auth（拿 baseInfo，并开启后续 updateBaseInfo 推送），再要 externalUserId
+    // JS-SDK 版：先 auth（拿 code + baseInfo，并开启后续 updateBaseInfo 推送），再要 externalUserId
     var auth = await ask('sidebarAuth');
     var b = auth && auth.baseInfo;
     if (b) {
+      if (b.code) lastCode = b.code;
       if (b.juziChatId)   out.chatId = b.juziChatId;
       if (b.juziChatWxid) out.wxid   = b.juziChatWxid;
     }
     var c = await ask('getCurExternalContact');
-    if (c && c.externalUserId) out.externalUserId = c.externalUserId;
-    if (!out.externalUserId) {                        // 兜底：完整会话信息里也带
-      var info = await ask('getCurChatInfo');
-      if (info && !info.err_msg) {
-        if (info.wxUserId) out.externalUserId = info.wxUserId;
-        if (info.wxid && !out.wxid) out.wxid = info.wxid;
-        if (info.id && !out.chatId) out.chatId = info.id;
-      }
+    if (c && c.externalUserId) return { externalUserId: c.externalUserId };
+    var info = await ask('getCurChatInfo');           // 兜底：完整会话信息里也带
+    if (info && !info.err_msg) {
+      if (info.wxUserId) return { externalUserId: info.wxUserId };
+      if (info.wxid && !out.wxid) out.wxid = info.wxid;
+      if (info.id && !out.chatId) out.chatId = info.id;
     }
     return out;
+  }
+
+  // ── 会话：用宿主的一次性 code 换本服务令牌（兑换在服务端做，浏览器不碰共享密钥）──
+  async function ensureSession(force){
+    if (sessionToken && !force) return sessionToken;
+    if (force) {                                      // 令牌过期：向宿主再要一个新 code
+      sessionToken = null;
+      var a = await ask('sidebarAuth');
+      if (a && a.baseInfo && a.baseInfo.code) lastCode = a.baseInfo.code;
+    }
+    if (!lastCode) return null;
+    var code = lastCode; lastCode = '';               // code 一次性消费，用掉即弃
+    try {
+      var r = await fetch('/logic/sidebar-session', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: code }),
+      });
+      if (!r.ok) return null;
+      var d = await r.json();
+      sessionToken = (d && d.token) || null;
+      return sessionToken;
+    } catch (e) { return null; }
+  }
+
+  /** 带会话头请求；遇 401 自动换新 code 重试一次（令牌 30min 过期，侧边栏可能开一整天）。 */
+  async function authedFetch(url){
+    var t = await ensureSession(false);
+    if (!t) { var e = new Error('身份校验失败'); e.noAuth = true; throw e; }
+    var res = await fetch(url, { headers: { 'Accept':'application/json', 'X-Sidebar-Session': t } });
+    if (res.status === 401) {
+      t = await ensureSession(true);
+      if (!t) { var e2 = new Error('身份校验失败'); e2.noAuth = true; throw e2; }
+      res = await fetch(url, { headers: { 'Accept':'application/json', 'X-Sidebar-Session': t } });
+    }
+    return res;
   }
 
   function render(c){
@@ -122,7 +163,9 @@ a{color:var(--acc)}
     h += '</div>';
 
     var links = '';
-    if (c.hasResume && c.resumeUrl) links += '<a class="btn" href="' + esc(c.resumeUrl) + '" target="_blank" rel="noopener">简历' + (c.resumeName ? '（' + esc(c.resumeName) + '）' : '') + '</a> ';
+    // 简历用 fetch+blob 而非 <a href>：/logic/candidate-resume 要 X-Sidebar-Session 头，
+    // 而 <a href> 带不了请求头（同飞书附件 url 需 Bearer 的问题）。令牌也不该出现在 URL 里。
+    if (c.hasResume && c.resumeUrl) links += '<a class="btn" href="#" data-resume="' + esc(c.resumeUrl) + '">简历' + (c.resumeName ? '（' + esc(c.resumeName) + '）' : '') + '</a> ';
     if (c.evalDoc)    links += '<a class="btn" href="' + esc(c.evalDoc) + '" target="_blank" rel="noopener">面评</a> ';
     if (c.transcript) links += '<a class="btn" href="' + esc(c.transcript) + '" target="_blank" rel="noopener">逐字稿</a> ';
     if (c.meetingLink) links += '<a class="btn" href="' + esc(c.meetingLink) + '" target="_blank" rel="noopener">会议链接</a>';
@@ -158,14 +201,47 @@ a{color:var(--acc)}
       ['externalUserId','wxid','chatId','phone'].forEach(function(k){
         if (id[k]) p.push(k + '=' + encodeURIComponent(id[k]));
       });
-      var res = await fetch('/logic/candidate-card?' + p.join('&'), { headers:{ 'Accept':'application/json' } });
+      var res = await authedFetch('/logic/candidate-card?' + p.join('&'));
       if (!res.ok) throw new Error('HTTP ' + res.status);
       render(await res.json());
     } catch (e) {
       lastKey = '';                                 // 失败可重试（否则同一会话卡在错误态）
-      app.innerHTML = '<div class="tip err">加载失败：' + esc(e && e.message) + '</div>';
+      app.innerHTML = e && e.noAuth
+        ? '<div class="tip err">身份校验失败。<br/>请在聚合聊天工作台内打开，或联系管理员确认侧边栏鉴权已配置。</div>'
+        : '<div class="tip err">加载失败：' + esc(e && e.message) + '</div>';
     }
   }
+
+  // 简历下载：带会话头取字节 → blob → 触发下载。
+  // 用 <a download> 程序化点击而不是 window.open：await 之后已脱离用户手势上下文，
+  // window.open 会被弹窗拦截器挡掉。
+  app.addEventListener('click', async function(e){
+    var a = e.target && e.target.closest && e.target.closest('[data-resume]');
+    if (!a) return;
+    e.preventDefault();
+    if (a.dataset.busy) return;                     // 防连点重复下载
+    a.dataset.busy = '1';
+    var label = a.textContent;
+    a.textContent = '下载中…';
+    try {
+      var res = await authedFetch(a.getAttribute('data-resume'));
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      var blob = await res.blob();
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement('a');
+      link.href = url;
+      link.download = (label || '简历').replace(/^简历（|）$/g, '') || '简历';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(function(){ URL.revokeObjectURL(url); }, 60000);
+    } catch (err) {
+      alert(err && err.noAuth ? '身份校验失败，请在聚合聊天工作台内打开' : '简历下载失败：' + (err && err.message));
+    } finally {
+      a.textContent = label;
+      delete a.dataset.busy;
+    }
+  }, false);
 
   load();
 })();
