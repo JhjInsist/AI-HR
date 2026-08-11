@@ -88,7 +88,10 @@ a{color:var(--acc)}
           resolve(isOk(r, api) ? r : null);
         });
       } catch(e){ return resolve(null); }
-      setTimeout(function(){ if(!done){ done = true; resolve(null); } }, 3000);
+      // 没有 isJuziWx 标记时大概率等不到回应（helper 未注入），短超时快速失败，
+      // 否则用户要干等数秒才看到诊断。仍然发起调用而非硬门禁：万一将来标记被去掉，
+      // 功能不至于全废。
+      setTimeout(function(){ if(!done){ done = true; resolve(null); } }, sdkOk() ? 3000 : 800);
     });
   }
 
@@ -104,7 +107,7 @@ a{color:var(--acc)}
           fail: function(){ if(!done){ done = true; resolve(null); } },
         });
       } catch(e){ return resolve(null); }
-      setTimeout(function(){ if(!done){ done = true; resolve(null); } }, 3000);
+      setTimeout(function(){ if(!done){ done = true; resolve(null); } }, sdkOk() ? 3000 : 800);
     });
   }
 
@@ -145,7 +148,9 @@ a{color:var(--acc)}
   async function ids(){
     var q = qs(), out = {};
     if (q.code) lastCode = q.code;                    // 普通版：OAuth 回调把 code 带在 URL 上
-    // 直接指定（便于脱离聚合聊天单独验证：/logic/sidebar?phone=138xxxx）
+    // 用 query 直接指定要看的人（如 ?phone=138xxxx），便于在聚合聊天内定向排查。
+    // 注意：这**不能**脱离聚合聊天使用 —— 鉴权需要宿主签发的 code，纯浏览器打开会 401
+    //（这是 fail-closed 的预期表现）。加鉴权前的说明有误，此处更正。
     ['externalUserId','wxid','chatId','phone'].forEach(function(k){ if (q[k]) out[k] = q[k]; });
     if (out.externalUserId) return { externalUserId: out.externalUserId };
     if (out.phone) return out;
@@ -176,8 +181,11 @@ a{color:var(--acc)}
   // ── 会话：用宿主的一次性 code 换本服务令牌（兑换在服务端做，浏览器不碰共享密钥）──
   async function ensureSession(force){
     if (sessionToken && !force) return sessionToken;
-    if (force) {                                      // 令牌过期：向宿主再要一个新 code
-      sessionToken = null;
+    if (force) sessionToken = null;                   // 令牌过期：作废后重新换
+    // 手上没有可用 code 就向宿主要一个。放在这里而不是 ids() 里，是因为 ids() 对
+    // ?phone= / ?externalUserId= 会提前 return，若把取 code 留在那儿，这两条通路
+    // 在聚合聊天内也拿不到 code、建不了会话（曾是个真 bug）。
+    if (!lastCode) {
       var a = await invoke('sidebarAuth');
       var b = a && a.data && a.data.baseInfo;
       if (b && b.code) lastCode = b.code;
