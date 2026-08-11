@@ -44,7 +44,9 @@ async function main() {
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   const BFF = `http://127.0.0.1:${srv.address().port}`;
 
-  const base = { SIDEBAR_BFF_BASE: BFF, SIDEBAR_SESSION_SECRET: 'sekret-A' };
+  // 测试用假 BFF 直接挂在根上,故把路径覆盖成 bff 原生口径(无 /api 网关前缀)
+  const base = { SIDEBAR_OAUTH_BASE: BFF, SIDEBAR_SESSION_SECRET: 'sekret-A',
+    SIDEBAR_OAUTH_PATH: '/v1/oauth/getUserInfo' };
 
   // ── 1:正常兑换 → 拿到会话令牌,且 code 真的发给了 BFF ──
   {
@@ -92,7 +94,7 @@ async function main() {
     assert.equal(seen.length, before, '5: 未配置时不应发出任何请求');
     assert.equal(noBff.verify('anything'), null, '5: 未配置时 verify 一律失败');
 
-    const noSecret = new SidebarAuthService(cfg({ SIDEBAR_BFF_BASE: BFF }));
+    const noSecret = new SidebarAuthService(cfg({ SIDEBAR_OAUTH_BASE: BFF }));
     assert.equal(await noSecret.createSession('good'), null, '5: 未配签名密钥 → 拒绝');
     assert.equal(noSecret.verify('anything'), null, '5: 无密钥时 verify 一律失败');
     assert.equal(noSecret.enabled(), false, '5: enabled() 应如实反映未启用');
@@ -127,6 +129,28 @@ async function main() {
     const { token } = await svc.createSession('good');
     await new Promise((r) => setTimeout(r, 1100));
     assert.equal(svc.verify(token), null, '7: 过期即失效');
+  }
+
+  // ── 7b:默认兑换路径必须带 /api 前缀 ──
+  // 官方文档与 demo.html 都是 {console}/api/v1/oauth/getUserInfo;xiaoju-bff 里的路由本身
+  // 是 /v1/oauth/getUserInfo(无 /api,由网关加)。早先写成后者,指向公网域名时必 404、
+  // 鉴权全废且表现为「恒 401」不易察觉。这条钉住默认值,防止被改回去。
+  {
+    const before = seen.length;
+    const svc = new SidebarAuthService(cfg({
+      SIDEBAR_OAUTH_BASE: BFF, SIDEBAR_SESSION_SECRET: 'sekret-A',   // 刻意不配 PATH
+    }));
+    await svc.createSession('good');
+    const url = seen[before] || '';
+    assert.ok(url.startsWith('/api/v1/oauth/getUserInfo'),
+      `7b: 默认路径应为 /api/v1/oauth/getUserInfo(官方口径),实际=${url}`);
+
+    // 直连内网 bff 的部署可覆盖成无 /api 的原生路由
+    const before2 = seen.length;
+    const svc2 = new SidebarAuthService(cfg({ ...base }));
+    await svc2.createSession('good');
+    assert.ok((seen[before2] || '').startsWith('/v1/oauth/getUserInfo'),
+      '7b: SIDEBAR_OAUTH_PATH 可覆盖为 bff 原生路径');
   }
 
   // ══════════ controller 守卫接线(只测 service 不够:守卫漏接 = 鉴权白做) ══════════

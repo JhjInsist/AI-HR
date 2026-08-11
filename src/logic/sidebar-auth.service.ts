@@ -37,8 +37,26 @@ export class SidebarAuthService {
 
   constructor(private readonly config: ConfigService) {}
 
+  /**
+   * OAuth 兑换服务的基址。填聚合聊天控制台公网域名(官方文档口径),或内网 bff 地址。
+   * 两者的路径前缀不同,见 oauthPath()。
+   */
   private bffBase(): string {
-    return (this.config.get('SIDEBAR_BFF_BASE') || '').trim().replace(/\/$/, '');
+    return (this.config.get('SIDEBAR_OAUTH_BASE') || '').trim().replace(/\/$/, '');
+  }
+
+  /**
+   * 兑换接口路径。默认用官方文档的公网口径 `/api/v1/oauth/getUserInfo`
+   * (文档 https://s.apifox.cn/d292e311-af7c-4a68-bfe4-416fd1d657b6/6951436m0)。
+   *
+   * 注意:xiaoju-bff 里的实际路由是 `@Get('/v1/oauth/getUserInfo')`(无 /api),
+   * `/api` 由网关加。所以若 SIDEBAR_OAUTH_BASE 直连内网 bff,需把本项覆盖为
+   * `/v1/oauth/getUserInfo`,否则会 404。做成可配是因为两种部署都合法,
+   * 硬编码任一种都会在另一种下静默失败。
+   */
+  private oauthPath(): string {
+    const p = (this.config.get('SIDEBAR_OAUTH_PATH') || '/api/v1/oauth/getUserInfo').trim();
+    return p.startsWith('/') ? p : `/${p}`;
   }
 
   private secret(): string {
@@ -68,13 +86,13 @@ export class SidebarAuthService {
    */
   async createSession(code?: string): Promise<{ token: string; expiresIn: number } | null> {
     if (!this.enabled()) {
-      this.logger.warn('[侧边栏鉴权] 未配置 SIDEBAR_BFF_BASE / SIDEBAR_SESSION_SECRET,拒绝建会话');
+      this.logger.warn('[侧边栏鉴权] 未配置 SIDEBAR_OAUTH_BASE / SIDEBAR_SESSION_SECRET,拒绝建会话');
       return null;
     }
     const c = (code || '').toString().trim();
     if (!c) return null;
     try {
-      const { data } = await axios.get(`${this.bffBase()}/v1/oauth/getUserInfo`, {
+      const { data } = await axios.get(`${this.bffBase()}${this.oauthPath()}`, {
         params: { code: c }, timeout: 5000,
       });
       // BFF 用 errcode 表达失败:-1 无效/已消费、-2 过期、-4 缺 code

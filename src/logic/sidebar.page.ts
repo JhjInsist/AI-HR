@@ -1,18 +1,28 @@
-// 聚合聊天侧边栏 · 候选人卡片页（自包含，无外部依赖；由 GET /logic/sidebar 提供）
+// 聚合聊天侧边栏 · 候选人卡片页（由 GET /logic/sidebar 提供）
 //
-// 两种嵌入模式都支持（xiaoju-bot-pc/src/components/Sidebar/index.tsx）：
-//  ① JS-SDK 版（注册 URL 带 msgType=postMessage，推荐）：
-//     postMessage {type:'sidebarHelper', data:{api,reqId}} → 宿主回 {reqId,api,data}
-//     - sidebarAuth            拿 baseInfo（含 juziChatId/juziChatWxid），并让宿主后续推送 updateBaseInfo
-//     - getCurExternalContact  拿 externalUserId（命中率最高的键）
-//     - updateBaseInfo         宿主在切会话时主动推送 → 据此刷新卡片（iframe 不重载）
-//  ② 普通版：宿主把上下文拼进 iframe URL query（juziChatId/juziChatWxid/...，注意没有 externalUserId）
+// 用官方 JS-SDK，不自己实现 postMessage 协议：
+//   https://res.wx.qq.com/open/js/jweixin-1.2.0.js          （企微 SDK，提供 wx 全局）
+//   https://cdn.botorange.com/js/sidebar/juzi-helper-1.0.11.js（句子 helper，patch wx）
+// 文档 https://s.apifox.cn/d292e311-af7c-4a68-bfe4-416fd1d657b6/6951436m0
+//
+// 契约要点（读 helper 源码确认，非推测）：
+// - helper 无条件赋值 window.juziWx；window.wx 仅在 (非微信UA && 带 juziSidebar && 在 iframe 内) 时覆盖
+//   → 取 SDK 一律写 window.juziWx || window.wx
+// - invoke() 只支持 6 个 api：getCurExternalContact / getCurExternalChat / sendChatMessage /
+//   sendMultiChatMessage / sidebarAuth / updateBaseInfo
+//   getCurChatInfo / openEnterpriseChat / previewImage 是**对象方法**（{success,fail} 形式），不能走 invoke
+// - 成功判定：err_msg === '<api>:ok'
+// - getCurExternalContact 的回调里字段叫 userId（helper 把宿主的 externalUserId 改了名）
+// - config 是空函数、ready 直接执行回调 → 不需要签名 / agentConfig
+// - reqType:'listen' 注册的 Promise 只 resolve 一次 → updateBaseInfo 每次触发后必须重新注册
 export const SIDEBAR_HTML = `<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>候选人</title>
+<script src="https://res.wx.qq.com/open/js/jweixin-1.2.0.js"></script>
+<script src="https://cdn.botorange.com/js/sidebar/juzi-helper-1.0.11.js"></script>
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--ink:#1c1f24;--sub:#6b7280;--line:#e5e7eb;--acc:#2f6f4f;--warn:#b45309;--radius:8px}
 @media (prefers-color-scheme:dark){:root{--bg:#14161a;--card:#1d2026;--ink:#e8eaed;--sub:#9aa1ab;--line:#2c3038;--acc:#4ea87a}}
@@ -44,10 +54,9 @@ a{color:var(--acc)}
 <script>
 (function(){
   var app = document.getElementById('app');
-  var reqSeq = 0, pending = {}, lastKey = '';
-  // 会话令牌只放内存变量：不落 localStorage/sessionStorage，页面一关即失效
-  var sessionToken = null;
-  var lastCode = '';            // 宿主签发的一次性 OAuth code（用掉即弃）
+  var lastKey = '';
+  var sessionToken = null;   // 只放内存变量：不落 localStorage，页面一关即失效
+  var lastCode = '';         // 宿主签发的一次性 OAuth code（用掉即弃）
 
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
@@ -56,28 +65,76 @@ a{color:var(--acc)}
     s.split('&').forEach(function(kv){ var i=kv.indexOf('='); if(i>0)
       o[decodeURIComponent(kv.slice(0,i))]=decodeURIComponent(kv.slice(i+1)); }); return o; }
 
-  // ── 与宿主通信（JS-SDK 版）──
-  function ask(api, timeout){
+  // ── 官方 SDK ──
+  function sdk(){ return window.juziWx || window.wx || null; }
+  function isOk(r, api){ var m = (r && (r.err_msg || r.errMsg)) || ''; return m === api + ':ok'; }
+
+  /** invoke 形式（仅限 helper 支持的 6 个 api）。失败/超时统一返回 null。 */
+  function invoke(api, params){
     return new Promise(function(resolve){
-      if (window.parent === window) return resolve(null);   // 非 iframe，直接跳过
-      var reqId = 'r' + (++reqSeq);
+      var s = sdk();
+      if (!s || typeof s.invoke !== 'function') return resolve(null);
       var done = false;
-      pending[reqId] = function(data){ done = true; resolve(data); };
-      try { window.parent.postMessage({ type:'sidebarHelper', data:{ api: api, reqId: reqId } }, '*'); }
-      catch(e){ return resolve(null); }
-      setTimeout(function(){ if(!done){ delete pending[reqId]; resolve(null); } }, timeout || 2500);
+      try {
+        s.invoke(api, params || {}, function(r){
+          if (done) return;
+          done = true;
+          resolve(isOk(r, api) ? r : null);
+        });
+      } catch(e){ return resolve(null); }
+      setTimeout(function(){ if(!done){ done = true; resolve(null); } }, 3000);
     });
   }
 
-  window.addEventListener('message', function(e){
-    var p = e.data || {};
-    if (p.reqId && pending[p.reqId]) { var cb = pending[p.reqId]; delete pending[p.reqId]; cb(p.data); return; }
-    // 宿主切会话时主动推送（sendResponse({api:'updateBaseInfo'...})）→ 重新识别并刷新
-    if (p.api === 'updateBaseInfo') { load(); }
-  }, false);
+  /** getCurChatInfo 是对象方法，不走 invoke（helper 源码里它不在 invoke 的 switch 内）。 */
+  function chatInfo(){
+    return new Promise(function(resolve){
+      var s = sdk();
+      if (!s || typeof s.getCurChatInfo !== 'function') return resolve(null);
+      var done = false;
+      try {
+        s.getCurChatInfo({
+          success: function(d){ if(!done){ done = true; resolve(d || null); } },
+          fail: function(){ if(!done){ done = true; resolve(null); } },
+        });
+      } catch(e){ return resolve(null); }
+      setTimeout(function(){ if(!done){ done = true; resolve(null); } }, 3000);
+    });
+  }
+
+  /**
+   * 宿主切会话时会推 updateBaseInfo。helper 的 listen Promise 只 resolve 一次，
+   * 所以每次触发后必须重新注册，否则只会刷新一次。
+   *
+   * listen 注册只挂 Promise、不 postMessage，且 reject 仅在「收到带 err_msg 的包」时发生，
+   * 所以重注册天然被入站消息节流，不会紧循环。下面的退避只是兜底：万一宿主异常刷包
+   * （秒回且无 data），避免无限重注册。
+   */
+  var biFails = 0;
+  function watchBaseInfo(){
+    var s = sdk();
+    if (!s || typeof s.invoke !== 'function') return;
+    if (biFails > 8) return;                        // 反复失败：放弃监听（仍可手动切会话触发 load）
+    var t0 = Date.now();
+    try {
+      s.invoke('updateBaseInfo', { reqType: 'listen' }, function(r){
+        var hasData = !!(r && r.data);
+        if (!hasData && Date.now() - t0 < 300) {     // 秒回且无数据 → 视为失败
+          biFails++;
+          setTimeout(watchBaseInfo, Math.min(1000 * biFails, 8000));
+          return;
+        }
+        biFails = 0;
+        var b = r && r.data && r.data.baseInfo;
+        if (b && b.code) lastCode = b.code;
+        load();
+        watchBaseInfo();          // 重新注册，继续监听后续切换
+      });
+    } catch(e){ /* SDK 不可用时静默 */ }
+  }
 
   // ── 收集候选人标识 ──
-  // 注意：服务端对标识做了冲突校验（切会话时宿主可能残留上一会话的 chatId，见 review #2），
+  // 服务端对标识做了冲突校验（切会话时宿主可能残留上一会话的 chatId，见 review #2），
   // 所以拿到最可信的 externalUserId 后就**只发它**，不要把可能过期的 chatId 一起带上。
   async function ids(){
     var q = qs(), out = {};
@@ -86,24 +143,26 @@ a{color:var(--acc)}
     ['externalUserId','wxid','chatId','phone'].forEach(function(k){ if (q[k]) out[k] = q[k]; });
     if (out.externalUserId) return { externalUserId: out.externalUserId };
     if (out.phone) return out;
-    // 普通版：URL 里有 juziChatId / juziChatWxid（无 externalUserId）
+    // 普通版：宿主把上下文拼进 iframe URL（无 externalUserId）
     if (q.juziChatId)   out.chatId = q.juziChatId;
     if (q.juziChatWxid) out.wxid   = q.juziChatWxid;
-    // JS-SDK 版：先 auth（拿 code + baseInfo，并开启后续 updateBaseInfo 推送），再要 externalUserId
-    var auth = await ask('sidebarAuth');
-    var b = auth && auth.baseInfo;
+    // JS-SDK 版：先 sidebarAuth 拿 code + baseInfo
+    var auth = await invoke('sidebarAuth');
+    var b = auth && auth.data && auth.data.baseInfo;
     if (b) {
       if (b.code) lastCode = b.code;
       if (b.juziChatId)   out.chatId = b.juziChatId;
       if (b.juziChatWxid) out.wxid   = b.juziChatWxid;
     }
-    var c = await ask('getCurExternalContact');
-    if (c && c.externalUserId) return { externalUserId: c.externalUserId };
-    var info = await ask('getCurChatInfo');           // 兜底：完整会话信息里也带
-    if (info && !info.err_msg) {
+    // helper 把宿主的 externalUserId 改名为 userId 回调给调用方
+    var c = await invoke('getCurExternalContact');
+    if (c && c.userId) return { externalUserId: c.userId };
+    var info = await chatInfo();                      // 兜底：完整会话信息里也带
+    if (info) {
       if (info.wxUserId) return { externalUserId: info.wxUserId };
       if (info.wxid && !out.wxid) out.wxid = info.wxid;
-      if (info.id && !out.chatId) out.chatId = info.id;
+      var cid = info.Id || info.id;                   // 文档写 Id，宿主源码发 id
+      if (cid && !out.chatId) out.chatId = cid;
     }
     return out;
   }
@@ -113,8 +172,9 @@ a{color:var(--acc)}
     if (sessionToken && !force) return sessionToken;
     if (force) {                                      // 令牌过期：向宿主再要一个新 code
       sessionToken = null;
-      var a = await ask('sidebarAuth');
-      if (a && a.baseInfo && a.baseInfo.code) lastCode = a.baseInfo.code;
+      var a = await invoke('sidebarAuth');
+      var b = a && a.data && a.data.baseInfo;
+      if (b && b.code) lastCode = b.code;
     }
     if (!lastCode) return null;
     var code = lastCode; lastCode = '';               // code 一次性消费，用掉即弃
@@ -191,7 +251,11 @@ a{color:var(--acc)}
       var id = await ids();
       var key = ['externalUserId','wxid','chatId','phone'].map(function(k){ return id[k]||''; }).join('|');
       if (!key.replace(/\\|/g,'')) {
-        app.innerHTML = '<div class="tip">请选择一个候选人会话。</div>';
+        // 在 iframe 内却什么都拿不到，多半是 SDK 没加载成功（CDN 不可达）
+        var noSdk = (window !== window.parent) && !sdk();
+        app.innerHTML = noSdk
+          ? '<div class="tip err">侧边栏 SDK 未加载。<br/>请检查能否访问 cdn.botorange.com。</div>'
+          : '<div class="tip">请选择一个候选人会话。</div>';
         return;
       }
       if (key === lastKey) return;                  // 同一会话不重复请求
@@ -243,6 +307,7 @@ a{color:var(--acc)}
     }
   }, false);
 
+  watchBaseInfo();   // 监听宿主切会话
   load();
 })();
 </script>
