@@ -15,6 +15,53 @@ export class TableService {
     return (this.config.get('TABLE_SERVICE_URL') || process.env.TABLE_SERVICE_URL || '').replace(/\/$/, '');
   }
 
+  /** 只读接口的共享 token(表格服务 /candidate 要求 X-AIHR-Token)。 */
+  private authHeaders(): Record<string, string> {
+    const tok = this.config.get('AIHR_TABLE_TOKEN');
+    return tok ? { 'X-AIHR-Token': tok } : {};
+  }
+
+  /**
+   * 查候选人进度表字段(纯读)→ 表格服务 GET /candidate。
+   * 供聚合聊天侧边栏卡片补充 mongo 里没有的字段(候选人身份/岗位大类/渠道/简历筛选/备忘录/简历附件)。
+   * 读路径超时比写短(侧边栏是用户同步等待,表格服务无响应不能让卡片卡住);失败返回 null 不抛。
+   */
+  async getCandidate(p: { dataId?: string; phone?: string }): Promise<Record<string, any> | null> {
+    const base = this.base();
+    if (!base) { this.logger.log(`[表格服务未配置] getCandidate ${p.dataId || p.phone || ''}`); return null; }
+    try {
+      const { data } = await axios.get(`${base}/candidate`, {
+        params: { dataId: p.dataId || '', phone: p.phone || '' },
+        headers: this.authHeaders(),
+        timeout: 5000,
+      });
+      return data?.found ? data : null;
+    } catch (e: any) {
+      this.logger.error(`查候选人字段失败 ${p.dataId || p.phone || ''}: ${e?.message}`);
+      return null;
+    }
+  }
+
+  /** 取简历附件原始字节 → 表格服务 GET /candidate/resume。失败返回 null 不抛。 */
+  async getResume(p: { dataId?: string; phone?: string }): Promise<{ data: Buffer; name: string } | null> {
+    const base = this.base();
+    if (!base) { this.logger.log(`[表格服务未配置] getResume ${p.dataId || p.phone || ''}`); return null; }
+    try {
+      const res = await axios.get(`${base}/candidate/resume`, {
+        params: { dataId: p.dataId || '', phone: p.phone || '' },
+        headers: this.authHeaders(),
+        timeout: 20000,           // 附件下载,比字段查询宽松
+        responseType: 'arraybuffer',
+      });
+      const cd = String(res.headers?.['content-disposition'] || '');
+      const m = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+      return { data: Buffer.from(res.data), name: m ? decodeURIComponent(m[1]) : '简历.pdf' };
+    } catch (e: any) {
+      this.logger.error(`取简历附件失败 ${p.dataId || p.phone || ''}: ${e?.message}`);
+      return null;
+    }
+  }
+
   /** 回填进度/备忘录 → 表格服务 POST /progress/backfill */
   async backfill(p: {
     dataId?: string; phone: string; event: string; note: string;

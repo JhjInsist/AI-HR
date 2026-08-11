@@ -56,13 +56,13 @@ export class ReachTask {
   @Prop({ type: String, enum: ReachStatus, default: ReachStatus.PENDING, index: true })
   status: ReachStatus;
 
-  @Prop()
+  @Prop({ index: true })
   wxid: string;                        // 好友通过后填充
 
-  @Prop()
-  externalUserId: string;              // 好友通过后填充
+  @Prop({ index: true })
+  externalUserId: string;              // 好友通过后填充(侧边栏卡片高频按此查)
 
-  @Prop()
+  @Prop({ index: true })
   chatId: string;                      // 发消息寻址用
 
   @Prop({ default: 0 })

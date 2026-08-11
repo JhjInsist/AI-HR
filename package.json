@@ -6,6 +6,8 @@
   "scripts": {
     "build": "nest build",
     "test:regression": "npm run build && node tests/reply-regression.test.js",
+    "test:sidebar": "npm run build && node tests/sidebar-candidate.test.js && node tests/sidebar-auth.test.js && node tests/sidebar-page.test.js",
+    "test": "npm run build && node tests/reply-regression.test.js && node tests/sidebar-candidate.test.js && node tests/sidebar-auth.test.js && node tests/sidebar-page.test.js",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main.js"
