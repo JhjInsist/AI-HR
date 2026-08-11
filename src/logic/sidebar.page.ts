@@ -66,7 +66,13 @@ a{color:var(--acc)}
       o[decodeURIComponent(kv.slice(0,i))]=decodeURIComponent(kv.slice(i+1)); }); return o; }
 
   // ── 官方 SDK ──
+  // 取 juziWx 优先：helper 无条件赋值它，而 window.wx 只在特定条件下才被覆盖
+  // （若 jweixin 是 npm 引入或 helper 未加载，window.wx 会是原生企微 SDK，没有句子的 invoke 分支）
   function sdk(){ return window.juziWx || window.wx || null; }
+  // isJuziWx 是 helper 打的标记，用来区分「helper 真的注入了」与「只有原生 jweixin」。
+  // 不用它做调用门禁（万一将来版本去掉标记就全废），只用于诊断报错，避免把
+  // 「CDN 没加载」误报成「没选会话」。
+  function sdkOk(){ var s = sdk(); return !!(s && s.isJuziWx && typeof s.invoke === 'function'); }
   function isOk(r, api){ var m = (r && (r.err_msg || r.errMsg)) || ''; return m === api + ':ok'; }
 
   /** invoke 形式（仅限 helper 支持的 6 个 api）。失败/超时统一返回 null。 */
@@ -251,10 +257,12 @@ a{color:var(--acc)}
       var id = await ids();
       var key = ['externalUserId','wxid','chatId','phone'].map(function(k){ return id[k]||''; }).join('|');
       if (!key.replace(/\\|/g,'')) {
-        // 在 iframe 内却什么都拿不到，多半是 SDK 没加载成功（CDN 不可达）
-        var noSdk = (window !== window.parent) && !sdk();
-        app.innerHTML = noSdk
-          ? '<div class="tip err">侧边栏 SDK 未加载。<br/>请检查能否访问 cdn.botorange.com。</div>'
+        // 在 iframe 内却什么都拿不到：优先报 SDK 问题，否则才是真没选会话。
+        // 否则 helper 未注入时会静默超时并显示「请选择会话」，把加载失败误报成操作提示。
+        var inFrame = window !== window.parent;
+        app.innerHTML = (inFrame && !sdkOk())
+          ? '<div class="tip err">侧边栏 SDK 未就绪。<br/>请检查浏览器能否访问 res.wx.qq.com 与 cdn.botorange.com，'
+            + '<br/>并确认工具栏地址带 <code>msgType=postMessage</code> 且已勾选「JS-SDK版」。</div>'
           : '<div class="tip">请选择一个候选人会话。</div>';
         return;
       }
