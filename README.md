@@ -116,15 +116,23 @@ npm run start:dev      # 本地热重载
 ```bash
 npm run build                                                    # 本地编译
 rsync -az ./dist/ root@101.126.100.251:/opt/miaopin-service/dist/
-ssh root@101.126.100.251 'cd /opt/miaopin-service && \
-  docker build -t miaopin-service . && \
+APP_VERSION="$(node -p \"require('./package.json').version\")"
+GIT_COMMIT="$(git rev-parse --short=12 HEAD)"
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+ssh root@101.126.100.251 "cd /opt/miaopin-service && \
+  docker build -t miaopin-service \
+    --build-arg APP_VERSION='$APP_VERSION' \
+    --build-arg GIT_COMMIT='$GIT_COMMIT' \
+    --build-arg BUILD_TIME='$BUILD_TIME' . && \
   docker rm -f miaopin ; \
   docker run -d --name miaopin --restart unless-stopped \
-    -p 80:80 -v /opt/miaopin-service/data:/app/data --env-file .env miaopin-service'
+    -p 80:80 -v /opt/miaopin-service/data:/app/data --env-file .env miaopin-service && \
+  curl -fsS http://127.0.0.1/feishu/health"
 ```
 
 - Dockerfile 用 `COPY dist ./dist`（用预编译产物，不在镜像里 build）→ **改代码必须先 `npm run build` 再 rsync dist**
 - `.env`（密钥）和 `data/`（配置）在服务器，不经过 git/CI
+- 部署命令从本地当前提交生成 `APP_VERSION`、`GIT_COMMIT`、`BUILD_TIME` 并显式传给 Docker；末尾健康检查应返回相同的 `git_commit`，且三个字段均不得为 `unknown`。若不符，保留旧容器/回滚到上一镜像，不要继续发布。
 
 ---
 
