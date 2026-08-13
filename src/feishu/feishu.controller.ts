@@ -17,7 +17,14 @@ export class FeishuController {
 
   @Get('health')
   health() {
-    return { ok: true, service: 'miaopin-service', ts: Date.now() };
+    return {
+      ok: true,
+      service: 'miaopin-service',
+      version: process.env.APP_VERSION || '0.1.0',
+      git_commit: process.env.GIT_COMMIT || 'unknown',
+      build_time: process.env.BUILD_TIME || 'unknown',
+      ts: Date.now(),
+    };
   }
 
   /** 对话测试：GET /feishu/converse?text= → 大模型意图分类 + 话术（不落库） */
