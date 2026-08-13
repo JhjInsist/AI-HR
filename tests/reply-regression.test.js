@@ -13,6 +13,7 @@ const {
 const { FeishuService } = require('../dist/feishu/feishu.service');
 const { ReachStatus } = require('../dist/reach/reach.schema');
 const { MiaohuiService } = require('../dist/miaohui/miaohui.service');
+const { FeishuController } = require('../dist/feishu/feishu.controller');
 
 function query(result) {
   return {
@@ -61,6 +62,25 @@ function makeService(sendByWecom, taskForQueries = null) {
 }
 
 async function main() {
+  const previousBuildMetadata = {
+    APP_VERSION: process.env.APP_VERSION,
+    GIT_COMMIT: process.env.GIT_COMMIT,
+    BUILD_TIME: process.env.BUILD_TIME,
+  };
+  process.env.APP_VERSION = '0.1.0';
+  process.env.GIT_COMMIT = 'abc123def456';
+  process.env.BUILD_TIME = '2026-08-13T08:00:00Z';
+  const health = new FeishuController({}).health();
+  assert.equal(health.ok, true);
+  assert.equal(health.service, 'miaopin-service');
+  assert.equal(health.version, '0.1.0');
+  assert.equal(health.git_commit, 'abc123def456');
+  assert.equal(health.build_time, '2026-08-13T08:00:00Z');
+  Object.entries(previousBuildMetadata).forEach(([key, value]) => {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  });
+
   const feishuSource = fs.readFileSync(require.resolve('../dist/feishu/feishu.service'), 'utf8');
   assert.match(
     feishuSource,
@@ -302,7 +322,7 @@ async function main() {
   assert.equal(apiRequest.body.wecomUserId, 'zhangsan');
   assert.equal(apiRequest.body.externalUserId, 'wm-api');
 
-  console.log('reply regression: 57/57 PASS');
+  console.log('reply regression: 58/58 PASS');
 }
 
 main().catch((error) => {

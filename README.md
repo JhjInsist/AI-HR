@@ -39,7 +39,7 @@ AI 招聘自动化系统的**触达服务**：负责候选人的加好友触达�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/feishu/webhook` | 飞书事件回调（@机器人消息 → 群运维助手） |
-| GET | `/feishu/health` | 健康检查 |
+| GET | `/feishu/health` | 健康检查，含当前运行版本、提交号和构建时间 |
 | GET | `/feishu/intent?text=` | 测试意图分类 |
 | GET | `/feishu/converse?text=&candidate=` | 测试触达对话全链路 |
 | GET | `/admin` | 配置台（可视化改表格/Agent/触达/秒回配置，热生效） |
@@ -52,6 +52,23 @@ curl -X POST http://ai-hr.juzibot.com/logic/reach \
 # → {"ok":true,"code":0,"name":"张三","phone":"138xxxxxxxx"}
 ```
 > `phone` 走正则 `1[3-9]\d{9}` 校验，非法直接返回 `{ok:false}`；`helloMsg` 不传则用配置的 `HELLO_MSG`。
+
+### 线上版本核对
+
+访问 `GET /feishu/health` 可确认当前容器实际运行的版本，例如：
+
+```json
+{"ok":true,"service":"miaopin-service","version":"0.1.0","git_commit":"94e3098","build_time":"2026-08-13T08:00:00Z"}
+```
+
+构建镜像时传入这三个非敏感元数据；未传时接口会返回默认值或 `unknown`：
+
+```bash
+docker build -t miaopin-service \
+  --build-arg APP_VERSION="$(node -p \"require('./package.json').version\")" \
+  --build-arg GIT_COMMIT="$(git rev-parse --short=12 HEAD)" \
+  --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
+```
 
 ---
 
@@ -99,15 +116,23 @@ npm run start:dev      # 本地热重载
 ```bash
 npm run build                                                    # 本地编译
 rsync -az ./dist/ root@101.126.100.251:/opt/miaopin-service/dist/
-ssh root@101.126.100.251 'cd /opt/miaopin-service && \
-  docker build -t miaopin-service . && \
+APP_VERSION="$(node -p \"require('./package.json').version\")"
+GIT_COMMIT="$(git rev-parse --short=12 HEAD)"
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+ssh root@101.126.100.251 "cd /opt/miaopin-service && \
+  docker build -t miaopin-service \
+    --build-arg APP_VERSION='$APP_VERSION' \
+    --build-arg GIT_COMMIT='$GIT_COMMIT' \
+    --build-arg BUILD_TIME='$BUILD_TIME' . && \
   docker rm -f miaopin ; \
   docker run -d --name miaopin --restart unless-stopped \
-    -p 80:80 -v /opt/miaopin-service/data:/app/data --env-file .env miaopin-service'
+    -p 80:80 -v /opt/miaopin-service/data:/app/data --env-file .env miaopin-service && \
+  curl -fsS http://127.0.0.1/feishu/health"
 ```
 
 - Dockerfile 用 `COPY dist ./dist`（用预编译产物，不在镜像里 build）→ **改代码必须先 `npm run build` 再 rsync dist**
 - `.env`（密钥）和 `data/`（配置）在服务器，不经过 git/CI
+- 部署命令从本地当前提交生成 `APP_VERSION`、`GIT_COMMIT`、`BUILD_TIME` 并显式传给 Docker；末尾健康检查应返回相同的 `git_commit`，且三个字段均不得为 `unknown`。若不符，保留旧容器/回滚到上一镜像，不要继续发布。
 
 ---
 
